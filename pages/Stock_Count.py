@@ -225,15 +225,24 @@ if not flagged.empty:
     st.markdown(f"**Scans flagged during {count}**")
     st.dataframe(flagged, hide_index=True, width="stretch")
 
-st.markdown(f"**Barcodes replaced at {loc}**")
+# Voids belong to the count picked above: after the count before it, up to it
+# (up to now for a count still open).
+this = hist[hist["Session Id"] == session_id]
+since, until = ((hist["Last Count"].max(), now) if this.empty
+                else (this["Previous Count"].iloc[0], this["Last Count"].iloc[0]))
+voids = voids[(voids["Voided"] <= until) & ((voids["Voided"] > since) | pd.isna(since))]
+window = f"{'the start' if pd.isna(since) else f'{since:%d %b %Y}'} to {until:%d %b %Y}"
+
+st.markdown(f"**Barcodes replaced at {loc} · {count}**")
+st.caption(f"Voided between the previous count and this one: {window}.")
 mine = voids[voids["Code"] == code]
 if mine.empty:
-    st.caption("No voided barcodes traced to this location.")
+    st.caption("No voided barcodes traced to this location in that time.")
 else:
     st.dataframe(mine.drop(columns="Code"), hide_index=True, width="stretch",
                  column_config={"Voided": st.column_config.DatetimeColumn(format="D MMM YYYY, HH:mm")})
 
-with st.expander(f"All voided barcodes ({len(voids)})"):
+with st.expander(f"All voided barcodes, every location, {window} ({len(voids)})"):
     st.dataframe(voids.assign(Location=voids["Code"].map(dict(zip(balance["Code"], balance["Location"])))
                               .fillna("Not traced")).drop(columns="Code"),
                  hide_index=True, width="stretch",

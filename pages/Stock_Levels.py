@@ -51,6 +51,11 @@ def _kpis(items: list[tuple[str, str, str | None]]) -> None:
 
 # ----------------------------------------------------------- Shop Stocks ---
 
+# CBD and VLD are the warehouses; every other location is a shop.
+WAREHOUSES = ("CBD/Stock", "VLD/Stock")
+WAREHOUSE, SHOP = "Warehouse", "Shop"
+TYPE_COLORS = {WAREHOUSE: theme.CATEGORICAL[0], SHOP: theme.CATEGORICAL[1]}
+
 @st.fragment()
 def render_shop_stock() -> None:
     df = db.run_query(queries.STOCK_LEVELS)
@@ -59,30 +64,37 @@ def render_shop_stock() -> None:
         st.info("No stock on hand right now.")
         return
 
-    by_location = df.groupby("Location", as_index=False)["Quantity"].sum()
-    top_location = by_location.nlargest(1, "Quantity")
-
-    k1, k2, k3, k4 = st.columns(4)
-    with k1.container(border=True):
-        st.metric("Total Units in Stock", f"{df['Quantity'].sum():,.0f}")
-    with k2.container(border=True):
-        st.metric("Locations Tracked", f"{by_location.shape[0]:,}")
-    with k3.container(border=True):
-        st.metric("Products Tracked", f"{df['Product'].nunique():,}")
-    with k4.container(border=True):
-        st.metric("Top Location", top_location["Location"].iloc[0] if not top_location.empty else "—")
-
+    df.insert(1, "Type", df["Location"].str.startswith(WAREHOUSES).map({True: WAREHOUSE, False: SHOP}))
+    units = df.groupby("Type")["Quantity"].sum().reindex([WAREHOUSE, SHOP], fill_value=0)
+    places = df.groupby("Type")["Location"].nunique().reindex([WAREHOUSE, SHOP], fill_value=0)
+    _kpis([
+        ("Total Units in Stock", f"{df['Quantity'].sum():,.0f}", None),
+        ("Warehouse Stock", f"{units[WAREHOUSE]:,.0f}", "CBD and VLD"),
+        ("Shop Stock", f"{units[SHOP]:,.0f}", f"{places[SHOP]:,} shops"),
+        ("Products Tracked", f"{df['Product'].nunique():,}", None),
+    ])
     st.caption(f"Last updated {datetime.now().strftime('%H:%M:%S')}")
+
+    views = {"All": [WAREHOUSE, SHOP], "🏭 Warehouses": [WAREHOUSE], "🏪 Shops": [SHOP]}
+    view = st.segmented_control("Show", list(views), default="All", key="stock_type_view",
+                                label_visibility="collapsed") or "All"
+    df = df[df["Type"].isin(views[view])]
+    if df.empty:
+        st.info("No stock on hand there right now.")
+        return
+    by_location = df.groupby(["Location", "Type"], as_index=False)["Quantity"].sum()
 
     with st.container(border=True):
         ranked = by_location.sort_values("Quantity", ascending=True)
         fig = go.Figure()
         fig.add_bar(
             y=ranked["Location"], x=ranked["Quantity"], orientation="h",
-            marker=dict(color=theme.sequential_colors(len(ranked)), cornerradius=4),
+            marker=dict(color=ranked["Type"].map(TYPE_COLORS).tolist(), cornerradius=4),
+            customdata=ranked["Type"], hovertemplate="%{y} (%{customdata}): %{x:,.0f}<extra></extra>",
         )
         theme.apply_layout(fig, show_legend=False)
-        fig.update_layout(title="Stock by Location", height=max(360, 28 * len(ranked)))
+        fig.update_layout(title="Stock by Location — warehouses and shops in different colours",
+                          height=max(360, 28 * len(ranked)))
         theme.show(fig, width="stretch")
 
     locations = sorted(df["Location"].unique())
@@ -655,6 +667,45 @@ def render_warehouse() -> None:
     with st.container(border=True):
         st.caption("Click a column header's filter icon to search or narrow that column.")
         grid.filterable_table(period.loc[period["Type"].isin(shown), EVENT_COLUMNS])
+
+
+    _cbd_movement(start, end)
+
+
+def _cbd_movement(start: date, end: date) -> None:
+    """In, out and transferred out of CBD/Stock, and where to (queries.CBD_STOCK_MOVES)."""
+    st.subheader(f"CBD/Stock movement · {start:%d %b} to {end:%d %b %Y}")
+    mv = db.run_query(queries.CBD_STOCK_MOVES, {"start_date": start, "end_date": end})
+    if mv.empty:
+        st.info("Nothing moved in or out of CBD/Stock in this period.")
+        return
+    came_in, went_out = mv[mv["Direction"] == "In"], mv[mv["Direction"] == "Out"]
+    out_kind = went_out.groupby("Kind")["Units"].sum()
+    transferred = went_out[went_out["Kind"] == "Transferred Out"]
+    _kpis([
+        ("In", f"{came_in['Units'].sum():,.0f}", f"from {came_in['Location'].nunique():,} locations"),
+        ("Out", f"{went_out['Units'].sum():,.0f}", "sold, transferred and adjusted"),
+        ("Transferred Out", f"{out_kind.get('Transferred Out', 0):,.0f}",
+         f"to {transferred['Location'].nunique():,} locations"),
+        ("Sold", f"{out_kind.get('Sold', 0):,.0f}", "to customers"),
+        ("Net Change", f"{came_in['Units'].sum() - went_out['Units'].sum():+,.0f}", "in minus out"),
+    ])
+    if not transferred.empty:
+        with st.container(border=True):
+            to = transferred.sort_values("Units")
+            fig = go.Figure()
+            fig.add_bar(y=to["Location"], x=to["Units"], orientation="h",
+                        marker=dict(color=theme.sequential_colors(len(to)), cornerradius=4))
+            theme.apply_layout(fig, show_legend=False)
+            fig.update_layout(title="Transferred Out of CBD/Stock — by Destination",
+                              height=max(360, 28 * len(to)))
+            theme.show(fig, width="stretch")
+    a, b = st.columns(2)
+    for col, title, part in [(a, "Came in from", came_in), (b, "Went out to", went_out)]:
+        with col:
+            st.markdown(f"**{title}**")
+            st.dataframe(part[["Location", "Kind", "Units", "Moves"]], hide_index=True, width="stretch",
+                         column_config={"Units": st.column_config.NumberColumn(format="%d")})
 
 
 SECTIONS = {"🏪 Shop Stocks": render_shop_stock, "🔮 Stock Prediction & Movement": render_prediction,

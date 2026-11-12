@@ -5776,3 +5776,32 @@ FROM flagged f LEFT JOIN who ON who.id = f.uid
 WHERE f.open OR f.at::DATE BETWEEN :start_date AND :end_date
 ORDER BY f.at DESC
 """
+
+
+# Everything that crossed CBD/Stock's boundary in the period, summed by
+# direction, kind and the location on the other side. Moves between CBD/Stock's
+# own sub-locations are not movement. Days are Nairobi days.
+CBD_STOCK_MOVES = """
+WITH moves AS (
+    SELECT m.product_qty AS qty, ls.complete_name LIKE 'CBD/Stock%' AS is_out,
+           CASE WHEN ls.complete_name LIKE 'CBD/Stock%' THEN ld.complete_name ELSE ls.complete_name END AS other,
+           CASE WHEN ls.complete_name LIKE 'CBD/Stock%' THEN ld.usage ELSE ls.usage END AS other_usage
+    FROM stock_move m
+    JOIN stock_location ls ON ls.id = m.location_id
+    JOIN stock_location ld ON ld.id = m.location_dest_id
+    WHERE m.state = 'done'
+      AND m.date >= CAST(:start_date AS TIMESTAMP) - INTERVAL '3 hours'
+      AND m.date <  CAST(:end_date AS TIMESTAMP) + INTERVAL '21 hours'
+      AND (ls.complete_name LIKE 'CBD/Stock%') <> (ld.complete_name LIKE 'CBD/Stock%')
+)
+SELECT CASE WHEN is_out THEN 'Out' ELSE 'In' END AS "Direction",
+       CASE other_usage
+            WHEN 'customer'  THEN CASE WHEN is_out THEN 'Sold' ELSE 'Customer Return' END
+            WHEN 'inventory' THEN 'Adjustment'
+            WHEN 'internal'  THEN CASE WHEN is_out THEN 'Transferred Out' ELSE 'Transferred In' END
+            WHEN 'transit'   THEN CASE WHEN is_out THEN 'Transferred Out' ELSE 'Transferred In' END
+            WHEN 'supplier'  THEN 'Supplier'
+            ELSE INITCAP(other_usage) END AS "Kind",
+       other AS "Location", SUM(qty) AS "Units", COUNT(*) AS "Moves"
+FROM moves GROUP BY 1, 2, 3 ORDER BY 1, 4 DESC
+"""

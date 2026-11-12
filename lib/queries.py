@@ -1,0 +1,5723 @@
+"""SQL for each dashboard domain.
+
+Each query is parameterized (never string-interpolated) and run through
+lib.db.run_query(sql, params) so values are always bound, not concatenated.
+"""
+
+SALES_PERFORMANCE_BY_BRANCH = """
+WITH date_range AS (
+    SELECT
+        CAST(:start_date AS DATE) AS start_date,
+        CAST(:end_date AS DATE) AS end_date
+),
+
+branch_totals AS (
+    SELECT
+        CASE
+            -- Website/Jumia orders are keyed by POS config, not warehouse — some
+            -- route through a fulfillment stock location (e.g. "Accessories &
+            -- Materials Store") that isn't a real retail branch and isn't in
+            -- branch_mapping below, which would silently drop them from the
+            -- grand total. Bucket by config name first, same as
+            -- PRODUCT_SALES_BY_SHOP/BAGS_SOLD_BY_CATEGORY already do.
+            WHEN lower(pconf.name) = 'jumia'
+                THEN 'Jumia'
+            WHEN lower(pconf.name) IN ('website sales', 'website') OR po.session_id IS NULL
+                THEN 'Website'
+            WHEN lower(pconf.name) = 'staff pos'
+                THEN 'Staff POS'
+            WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%'
+                THEN 'Sinza'
+            ELSE INITCAP(
+                    TRIM(REGEXP_REPLACE(
+                        COALESCE(sw.name, sl.complete_name, 'N/A'),
+                        '\\s*Shop\\s*', '', 'gi'
+                    ))
+                )
+        END                                                         AS branch,
+
+        -- Every line the customer was charged for except delivery: gift bags
+        -- and order-level "KES discount" lines count, delivery fees do not.
+        -- That is what Odoo's own dashboard reports — for 24 Sep 2026 both
+        -- read KES 1,369,141.64, the difference being exactly the day's
+        -- KES 9,450 of delivery fees.
+        -- Customization fees are left out too, as Odoo's dashboard does
+        -- (Mombasa, 1-16 Oct 2026: KES 1,400 of them, exactly the difference).
+        SUM(CASE
+            WHEN pt.name NOT ILIKE '%Delivery Fee%' AND pt.name NOT ILIKE '%Customization Fee%'
+            THEN pol.price_subtotal_incl / COALESCE(NULLIF(po.currency_rate, 0), 1)
+            ELSE 0
+        END)                                                        AS revenue,
+
+        -- Bags sold: bags and gift bags only (straps and other accessories
+        -- are not bags), never the combo container — Odoo records the bags
+        -- inside a combo as their own lines, so counting the bundle as well
+        -- counted a two-bag combo three times.
+    -- Bags sold nets refunds: a bag sold and refunded is not a bag sold.
+    -- That is how the daily Bags Sold reports count (13-19 Sep 2026 match to
+    -- the bag), and every refund in September 2026 was rung the same day as
+    -- its sale, so netting by day and netting by sale agree. Counting refunds
+    -- as movements, as Odoo's dashboard does, put every refund in twice.
+        SUM(CASE
+            WHEN (COALESCE(pc.name, '') ILIKE 'Bags%' OR pt.name ILIKE '%Gift Bag%')
+             AND COALESCE(pol.is_combo_line, FALSE) = FALSE
+             AND COALESCE(pt.is_combo, FALSE) = FALSE
+            THEN pol.qty ELSE 0
+        END)                                                        AS qty,
+
+        COUNT(DISTINCT CASE
+            WHEN po.customer_type = 'walkin' THEN po.id
+        END)                                                        AS walk_in_orders,
+
+        COUNT(DISTINCT CASE
+            WHEN po.customer_type = 'online' THEN po.id
+        END)                                                        AS online_orders,
+
+        COUNT(DISTINCT CASE
+            WHEN po.customer_type = 'activation' THEN po.id
+        END)                                                        AS activation_orders,
+
+        COUNT(DISTINCT po.id)                                       AS orders
+
+    FROM pos_order po
+
+    LEFT JOIN pos_order_line       pol   ON pol.order_id = po.id
+    LEFT JOIN product_product      pp    ON pp.id    = pol.product_id
+    LEFT JOIN product_template     pt    ON pt.id    = pp.product_tmpl_id
+    LEFT JOIN product_category     pc    ON pc.id    = pt.categ_id
+    LEFT JOIN pos_session          ps    ON ps.id    = po.session_id
+    LEFT JOIN pos_config           pconf ON pconf.id = ps.config_id
+    LEFT JOIN stock_picking_type   spt   ON spt.id   = pconf.picking_type_id
+    LEFT JOIN stock_warehouse      sw    ON sw.id    = spt.warehouse_id
+    LEFT JOIN stock_location       sl    ON sl.id    = spt.default_location_src_id,
+    date_range dr
+
+    WHERE
+        po.state IN ('done', 'paid', 'invoiced')
+        -- Refund lines carry a negative qty and a negative amount, and are
+        -- kept: they net returns off the takings the way Odoo reports it
+        -- (Eldoret keyed 777 Lola Black on 7 Sep 2026 and reversed 776 an
+        -- hour later; dropping the reversal overstated that day by KES 1.4m).
+        AND po.date_order >= dr.start_date
+        AND po.date_order < dr.end_date + INTERVAL '1 day'
+
+    GROUP BY
+        CASE
+            WHEN lower(pconf.name) = 'jumia'
+                THEN 'Jumia'
+            WHEN lower(pconf.name) IN ('website sales', 'website') OR po.session_id IS NULL
+                THEN 'Website'
+            WHEN lower(pconf.name) = 'staff pos'
+                THEN 'Staff POS'
+            WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%'
+                THEN 'Sinza'
+            ELSE INITCAP(
+                    TRIM(REGEXP_REPLACE(
+                        COALESCE(sw.name, sl.complete_name, 'N/A'),
+                        '\\s*Shop\\s*', '', 'gi'
+                    ))
+                )
+        END
+),
+
+period_target AS (
+    SELECT
+        CASE
+            WHEN (SELECT end_date FROM date_range) - (SELECT start_date FROM date_range) <= 1 THEN 'day'
+            WHEN (SELECT end_date FROM date_range) - (SELECT start_date FROM date_range) <= 7 THEN 'week'
+            ELSE 'month'
+        END AS selected_period
+),
+
+branch_mapping AS (
+    SELECT 'Sinza' AS branch_name, 'DAR-ES-ALAM' AS target_branch
+    UNION ALL SELECT 'Website', 'WEBSITE SALES'
+    UNION ALL SELECT 'Ktda', 'KTDA Shop'
+    UNION ALL SELECT 'Hilton', 'HILTON'
+    UNION ALL SELECT 'Busia', 'BUSIA'
+    UNION ALL SELECT 'Corporate', 'CORPORATE'
+    UNION ALL SELECT 'Nairobi', 'NAIROBI'
+    UNION ALL SELECT 'Kisumu', 'KISUMU'
+    UNION ALL SELECT 'Thika', 'THIKA'
+    UNION ALL SELECT 'Hazina', 'HAZINA'
+    UNION ALL SELECT 'Mombasa', 'MOMBASA'
+    UNION ALL SELECT 'Uganda', 'UGANDA'
+    UNION ALL SELECT 'Starmall', 'STARMALL'
+    UNION ALL SELECT 'Nanyuki', 'NANYUKI'
+    UNION ALL SELECT 'Nyeri', 'NYERI'
+    UNION ALL SELECT 'Nakuru', 'NAKURU'
+    UNION ALL SELECT 'Eldoret', 'ELDORET'
+    UNION ALL SELECT 'Rongai', 'RONGAI'
+    UNION ALL SELECT 'Kisii', 'KISII'
+    UNION ALL SELECT 'Kakamega', 'KAKAMEGA'
+    UNION ALL SELECT 'Kitengela', 'KITENGELA'
+    UNION ALL SELECT 'Meru', 'MERU'
+    -- No target, but Odoo counts its takings, so it is listed and totalled.
+    UNION ALL SELECT 'Staff POS', NULL
+    UNION ALL SELECT 'Jumia', NULL
+),
+
+results AS (
+    SELECT
+        bt.branch                                                       AS "Branch",
+        ROUND(bt.revenue, 2)                                            AS "Revenue",
+        bt.qty                                                          AS "Qty",
+        bt.walk_in_orders                                               AS "Walk-in Orders",
+        bt.online_orders                                                AS "Online Orders",
+        bt.activation_orders                                            AS "Activation Orders",
+        bt.orders                                                       AS "Orders",
+        COALESCE(spt.target_amount, 0)                                  AS "Target",
+        ROUND(
+            CASE
+                WHEN COALESCE(spt.target_amount, 0) = 0 THEN 0
+                ELSE (bt.revenue::NUMERIC / spt.target_amount * 100)
+            END,
+            2
+        )                                                               AS "% Achieved",
+        0                                                               AS sort_order
+
+    FROM branch_totals bt
+    JOIN branch_mapping bm ON LOWER(bt.branch) = LOWER(bm.branch_name)  -- shop locations with a target only
+    LEFT JOIN sales_pos_target spt ON (
+        bm.target_branch IS NOT NULL
+        AND spt.name ILIKE bm.target_branch || '%'
+        AND spt.period = (SELECT selected_period FROM period_target)
+        AND (SELECT end_date FROM date_range) BETWEEN spt.start_date AND spt.end_date
+    )
+
+    UNION ALL
+
+    SELECT
+        'GRAND TOTAL'                                                   AS "Branch",
+        ROUND(SUM(bt.revenue), 2)                                       AS "Revenue",
+        SUM(bt.qty)                                                     AS "Qty",
+        SUM(bt.walk_in_orders)                                          AS "Walk-in Orders",
+        SUM(bt.online_orders)                                           AS "Online Orders",
+        SUM(bt.activation_orders)                                       AS "Activation Orders",
+        SUM(bt.orders)                                                  AS "Orders",
+        (
+            SELECT COALESCE(SUM(target_amount), 0)
+            FROM sales_pos_target
+            WHERE period = (SELECT selected_period FROM period_target)
+            AND (SELECT end_date FROM date_range) BETWEEN start_date AND end_date
+            AND name NOT ILIKE '%FLASH SALE%'
+        )                                                               AS "Target",
+        ROUND(
+            (SUM(bt.revenue)::NUMERIC /
+            (SELECT COALESCE(SUM(target_amount), 1) FROM sales_pos_target
+             WHERE period = (SELECT selected_period FROM period_target)
+             AND (SELECT end_date FROM date_range) BETWEEN start_date AND end_date
+             AND name NOT ILIKE '%FLASH SALE%') * 100),
+            2
+        )                                                               AS "% Achieved",
+        1                                                               AS sort_order
+
+    FROM branch_totals bt
+    JOIN branch_mapping bm ON LOWER(bt.branch) = LOWER(bm.branch_name)  -- same restriction as above
+)
+
+SELECT
+    "Branch",
+    "Revenue",
+    "Qty",
+    "Walk-in Orders",
+    "Online Orders",
+    "Activation Orders",
+    "Orders",
+    "Target",
+    "% Achieved"
+FROM results
+ORDER BY sort_order, "% Achieved" DESC;
+"""
+
+# One row per SHOP + PRODUCT with quantity sold, over the given date range.
+# Masterfile products (the official catalog) are ranked first by qty sold,
+# then non-masterfile products (off-catalog/unlisted) below them, each block
+# sorted highest to lowest, with a TOTAL row closing out each block.
+PRODUCT_SALES_BY_SHOP = """
+WITH date_range AS (
+  SELECT
+    CAST(:start_date AS DATE) AS start_date,
+    CAST(:end_date AS DATE) AS end_date
+),
+
+master_order_raw AS (
+  SELECT name, ord
+  FROM UNNEST(ARRAY[
+    'Ace Croc Brown','Ace Red','Ace Beige','Ace Black TT','Ace Cracked',
+    'Ace Spice','Ace Chocolate','Ace Grey','Ace Dark Brown','Ace Red.Pattern',
+    'Ace Mustard','Ace Croc Pink','Ace Croc Orange','Ace Croc Mustard','Ace Blue',
+    'Ace Pink','Ace Brown','Ace Lilac','Ace Mint Green','Ace Green','Ace Croc Black',
+    'Adrian Black','Adrian Y.Dotted','Adrian Green','Adrian Grey','Adrian Nude','Adrian Brown',
+    'Alpha Travel Black','Alpha Travel Brown','Alpha Travel Nude','Alpha Travel Grey',
+    'Alpha Travel Yellow Dotted','Alpha Travel Green',
+    'Amari Black/Cracked','Amari Black/Yellow','Amari Black/Beige','Amari Black/Grey',
+    'Amari Black/D.Brown','Amari Black/Spice','Amari Black/Red','Amari Black/Choco',
+    'Amaya Black Tt','Amaya Spice','Amaya Cracked','Amaya Grey','Amaya Beige',
+    'Amaya Choco','Amaya Dark Brown','Amaya Red','Amaya Croc Black','Amaya Wooven Black',
+    'Amaya Wooven Maroon','Amaya Wooven Mustard','Amaya Wooven Purple','Amaya Green',
+    'Amaya Lilac','Amaya Mustard',
+    'Amora Black','Amora Red','Amora Pink','Amora Blue','Amora Green','Amora Mustard',
+    'Amora Maroon','Amora Purple',
+    'Ana Croc Mustard','Ana Croc Orange','Ana Croc Brown','Ana Croc Pink','Ana Blue',
+    'Ana Pink','Ana Mustard','Ana Brown','Ana Green','Ana Red P','Ana Black',
+    'Ankara Travel Black','Ankara Travel White','Ankara Travel Grey','Ankara Travel Nude',
+    'Ankara Travel Brown',
+    'Antitheft Black','Antitheft Brown','Antitheft Nude','Antitheft Grey',
+    'Antitheft Antelope Brown','Antitheft Green','Antitheft Cn Black',
+    'Aria Pro Red','Aria Pro Beige','Aria Pro Black','Aria Pro Cracked','Aria Pro Spice',
+    'Aria Pro Chocolate','Aria Pro Yellow','Aria Pro Maroon','Aria Pro Amber',
+    'Aria Pro Grey','Aria Pro Dark Brown',
+    'Aria Sling Red','Aria Sling Beige','Aria Sling Black','Aria Sling Cracked',
+    'Aria Sling Spice','Aria Sling Chocolate','Aria Sling Yellow','Aria Sling Maroon',
+    'Aria Sling Amber','Aria Sling Grey','Aria Sling Dark Brown',
+    'Arlo Man Bag Red','Arlo Man Bag Beige','Arlo Man Bag Black','Arlo Man Bag Cracked',
+    'Arlo Man Bag Spice','Arlo Man Bag Chocolate','Arlo Man Bag Yellow','Arlo Man Bag Maroon',
+    'Arlo Man Bag Amber','Arlo Man Bag Grey','Arlo Man Bag Dark Brown',
+    'Arm Band Spice','Arm Band Dark Brown','Arm Band Black','Arm Band Beige',
+    'Arm Band Cracked','Arm Band Grey','Arm Band Red','Arm Band Chocolate',
+    'Atlas Spice','Atlas Dark Brown','Atlas Black','Atlas Beige','Atlas Cracked',
+    'Atlas Grey','Atlas Red','Atlas Yellow Brown','Atlas Chocolate',
+    'Aurora Spice','Aurora Red.Pattern','Aurora Dark Brown','Aurora Black','Aurora Beige',
+    'Aurora Cracked','Aurora Grey','Aurora Red','Aurora Wooven Maroon','Aurora Wooven Black',
+    'Aurora Chocolate',
+    'Avana Hb Spice','Avana Hb Wooven Black','Avana Hb Wooven Maroon','Avana Hb Wooven Mustard',
+    'Avana Hb Wooven Purple','Avana Hb Dark Brown','Avana Hb Black','Avana Hb Beige',
+    'Avana Hb Cracked','Avana Hb Grey','Avana Hb Red','Avana Hb Yellow Brown',
+    'Avana Hb Amber','Avana Hb Maroon','Avana Hb Red P','Avana Hb Chocolate',
+    'Baby Bag Grey','Baby Bag Black','Baby Bag Nude','Baby Bag Brown','Baby Bag Green',
+    'Baby Bag Yellow Dotted',
+    'Bello Spice','Bello Cracked','Bello Black','Bello Grey','Bello Red','Bello Yellow',
+    'Bello Chocolate','Bello Beige',
+    'Belt Bag Black','Belt Bag Red','Belt Bag Cracked','Belt Bag Spice','Belt Bag Yellow',
+    'Belt Bag Nude','Belt Bag Grey','Belt Bag Chocolate','Belt Bag Dark Brown',
+    'Big Man Bag Black','Big Man Bag Brown','Big Man Bag Grey','Big Man Bag Nude',
+    'Big Man Bag Yellow Dotted','Big Man Bag Green',
+    'Bliss Chest Black','Bliss Chest Grey',
+    'Bonita Black','Bonita Cracked','Bonita Beige','Bonita Spice','Bonita Grey',
+    'Bonita Red','Bonita Yellow','Bonita Choco','Bonita D.Brown',
+    'Brief Case Brown','Brief Case Black','Brief Case Grey','Brief Case Nude','Brief Case Green',
+    'Butterfly Sling Cracked','Butterfly Sling Spice','Butterfly Sling Grey',
+    'Butterfly Sling Beige','Butterfly Sling Black','Butterfly Sling Red',
+    'Butterfly Sling Chocolate','Butterfly Sling Dark Brown','Butterfly Sling Yellow Brown',
+    'Cairo Bp Cracked','Cairo Bp Spice','Cairo Bp Beige','Cairo Bp Black','Cairo Bp Grey',
+    'Cairo Bp Red','Cairo Bp Dark Brown','Cairo Bp Yellow Brown','Cairo Bp Chocolate',
+    'Callista Cracked','Callista Spice','Callista Beige','Callista Black','Callista Grey',
+    'Callista Red','Callista Dark Brown','Callista Chocolate',
+    'Cathy Handbag Black','Cathy Handbag Spice','Cathy Handbag Cracked','Cathy Handbag Grey',
+    'Cathy Handbag Dark Brown','Cathy Handbag Beige','Cathy Handbag Red','Cathy Handbag Chocolate',
+    'Celine Sling Bag Black','Celine Sling Bag Spice','Celine Sling Bag Cracked',
+    'Celine Sling Bag Grey','Celine Sling Bag Beige','Celine Sling Bag Choco',
+    'Celine Sling Bag Dark Brown','Celine Sling Bag Red',
+    'Cess Hb Black','Cess Hb Spice','Cess Hb Cracked','Cess Hb Grey','Cess Hb Beige',
+    'Cess Hb Green','Cess Hb Choco','Cess Hb Dark Brown','Cess Hb Red',
+    'Charlotte Pink','Charlotte Black','Charlotte Brown','Charlotte Green','Charlotte Mustard',
+    'Charlotte Croc Mustard','Charlotte Croc Orange','Charlotte Croc Brown','Charlotte Croc Pink',
+    'Charlotte Grey','Charlotte Beige','Charlotte Dark Brown','Charlotte Cracked',
+    'Charlotte Red','Charlotte Spice','Charlotte Chocolate','Charlotte Blue',
+    'Chase Black','Chase Brown','Chase Grey','Chase Green','Chase Nude',
+    'Claire Handbag Black','Claire Handbag Spice','Claire Handbag Cracked','Claire Handbag Grey',
+    'Claire Handbag Wooven Maroon','Claire Handbag Wooven Black','Claire Handbag White','Claire Handbag Beige',
+    'Claire Handbag Dark Brown','Claire Handbag Red',
+    'Cleo Cracked','Cleo Grey','Cleo Black','Cleo Spice','Cleo Red','Cleo Chocolate',
+    'Cleo Yellow Brown','Cleo Dark Brown','Cleo Beige',
+    'Code 3 Nude','Code 3 Brown','Code 3 Black','Code 3 Grey','Code 3 Antelope Brown',
+    'Code 3 Green','Code 3 Blue','Code 3 Crimson',
+    'Code 4 Ankara Nude','Code 4 Ankara Green','Code 4 Ankara Brown','Code 4 Ankara Grey',
+    'Code 4 Ankara White','Code 4 Ankara Black',
+    'Code 9 Black','Code 9 Brown','Code 9 Green','Code 9 Yellow Dotted','Code 9 Grey','Code 9 Nude',
+    'College Hb Brown','College Hb Green','College Hb Black','College Hb Grey',
+    'College Hb Nude','College Hb Yellow Dotted',
+    'Cosmo Brown','Cosmo Green','Cosmo Black','Cosmo Grey','Cosmo Nude','Cosmo Yellow Dotted',
+    'Daria Chocolate','Daria Grey','Daria Cracked','Daria Dark Brown','Daria Black',
+    'Daria Spice','Daria Beige',
+    'Delica Black','Delica Red.Pattern','Delica Lilac','Delica Mustard','Delica Mint Green',
+    'Diaper Bag Titan 15','Diaper Bag Titan 11','Diaper Bag Titan 5','Diaper Bag Titan 6',
+    'Diaper Bag Pattern Blue','Diaper Bag Pattern Red','Diaper Bag Pattern Pink',
+    'Don Black','Don Brown','Don Nude','Don Grey','Don Yellow Dotted','Don Green',
+    'Double Press Grey','Double Press Green','Double Press Brown','Double Press Nude',
+    'Double Press Black','Double Press Yellow Dotted',
+    'Elektra Black','Elektra Beige','Elektra Spice','Elektra Grey','Elektra Cracked',
+    'Elektra Red','Elektra Dark Brown','Elektra Choco',
+    'Ella Sling Black','Ella Sling Melon','Ella Sling Silver','Ella Sling Mint Green',
+    'Ella Sling Lilac','Ella Sling Mustard','Ella Sling Dark Green','Ella Sling Navy Blue',
+    'Ella Sling Brown','Ella Sling Red P','Ella Sling Pink',
+    'Elyse Grey','Elyse D.Brown','Elyse Spice','Elyse Cracked','Elyse Black','Elyse Red',
+    'Elyse Beige','Elyse Chocolate','Elyse Red/Black','Elyse Spice/Black','Elyse Red/Beige',
+    'Elyse Black/Grey','Elyse Black/Cracked',
+    'Esmeralda Black','Esmeralda Brown','Esmeralda Nude','Esmeralda Green','Esmeralda Grey',
+    'Esmeralda Red','Esmeralda Blue',
+    'Fabela Black','Fabela Brown','Fabela Grey','Fabela Yellow Dotted','Fabela Green','Fabela Nude',
+    'Fanny Amapiano Black','Fanny Amapiano Brown','Fanny Amapiano Grey','Fanny Amapiano Cracked',
+    'Fanny Amapiano Nude',
+    'Fanny Pack Black','Fanny Pack Brown','Fanny Pack Grey','Fanny Pack Green',
+    'Fanny Pack Cracked','Fanny Pack Nude','Fanny Pack Dark Brown','Fanny Pack Black Tt',
+    'Fanny Pack Spice','Fanny Pack Yellow Dotted','Fanny Pack Grey Tt','Fanny Pack Black Mpw',
+    'Fanny Pack Beige Tt',
+    'Fayola Black','Fayola Grey','Fayola Nude','Fayola Green','Fayola Brown',
+    'Fayola Yellow Dotted','Fayola Titan 15',
+    'Feroz Grey','Feroz Red','Feroz Spice','Feroz Beige','Feroz Cracked','Feroz Black',
+    'Feroz Choco','Feroz Dark Brown','Feroz Yellow Brown',
+    'Foxy Melon','Foxy Mustard','Foxy Blue','Foxy Pink','Foxy Brown','Foxy Green','Foxy Black',
+    'Gift Bag A3','Gift Bag A4','Gift Bag A5','Gift Bag A4 Red',
+    'Gym Bag Brown','Gym Bag Green','Gym Bag Black','Gym Bag Grey','Gym Bag Nude',
+    'Gym Bag Yellow Dotted',
+    'Hood White','Hood N.Blue','Hood Green','Hood Maroon','Hood Grey','Hood Black','Hood Red',
+    'Icon Black','Icon Spice','Icon Grey','Icon Beige','Icon Cracked','Icon Red','Icon Choco',
+    'Imani Black 018','Imani Maroon 018','Imani Dark Brown 018','Imani Spice','Imani Grey',
+    'Imani Beige','Imani Red','Imani Beige 018','Imani Green Tt',
+    'Jabari Beige','Jabari Cracked','Jabari Maroon','Jabari Black','Jabari Dark Brown',
+    'Jade Spice','Jade Dark Brown','Jade Black','Jade Beige','Jade Cracked','Jade Grey',
+    'Jade Red','Jade Yellow Brown','Jade Chocolate',
+    'Jamela Spice','Jamela Grey','Jamela Cracked','Jamela Black','Jamela Red',
+    'Jamela Yellow Brown','Jamela Chocolate','Jamela Beige','Jamela Dark Brown',
+    'Jayden Man Black','Jayden Man Brown','Jayden Man Grey','Jayden Man Nude',
+    'Jayden Man Green','Jayden Man Yellow Dotted',
+    'Jumbo Black','Jumbo Brown','Jumbo Green','Jumbo Grey','Jumbo Nude','Jumbo Crimson',
+    'Jumbo Blue','Jumbo Yellow Dotted',
+    'Kai Black','Kai Grey','Kai Brown','Kai Beige','Kai Yellow Dotted','Kai Green',
+    'Kanji Spice','Kanji Black','Kanji Red','Kanji Navy','Kanji Choco','Kanji Beige',
+    'Kanji Cracked','Kanji Grey','Kanji Dark Brown',
+    'Kaos Grey','Kaos Spice','Kaos Cracked','Kaos Beige','Kaos Red','Kaos Black',
+    'Kaos Choco','Kaos Dark Brown','Kaos Yellow Brown',
+    'Karina Croc Black','Karina Red.Pattern','Karina Wooven Black','Karina Wooven Maroon',
+    'Karina Grey','Karina Spice','Karina Cracked','Karina Beige','Karina Red','Karina Black',
+    'Karina Choco','Karina Dark Brown','Karina Wooven Mustard','Karina Wooven Purple',
+    'Karina Croc Mustard','Karina Croc Brown','Karina Croc Pink','Karina Croc Orange',
+    'Kate Wooven Black','Kate Red.Pattern','Kate Maroon','Kate Wooven Mustard',
+    'Kate Wooven Purple','Kate Black/Red','Kate Maroon/Masturd','Kate Green/Red',
+    'Kate Brown/Red','Kate Black/Maroon','Kate Mustard/Red','Kate Yellow Brown',
+    'Kate Black','Kate Spice','Kate Grey','Kate Cracked','Kate Red','Kate Beige',
+    'Kate Dark Brown','Kate Chocolate',
+    'Kayla Dark Brown','Kayla Cracked','Kayla Spice','Kayla Grey','Kayla Black',
+    'Kayla Chocolate','Kayla Red',
+    'Kaz Black','Kaz Yellow Dotted','Kaz Brown','Kaz Nude','Kaz Grey','Kaz Green',
+    'Ladona Spice','Ladona Dark Brown','Ladona Black','Ladona Beige','Ladona Cracked',
+    'Ladona Grey','Ladona Red','Ladona Yellow Brown','Ladona Chocolate',
+    'Lafemme Black (Obsidian)','Lafemme Pink (Éclat)','Lafemme Red (Garnet)','Lafemme Wine Red (Mulberry)',
+    'Lamora Black','Lamora Sky Blue','Lamora Brown','Lamora Red',
+    'Lanka Wooven Black','Lanka Wooven Mustard','Lanka Wooven Purple','Lanka Wooven Maroon',
+    'Legacy Black','Legacy Brown','Legacy Grey','Legacy Dark Brown','Legacy Green',
+    'Legacy Cracked','Legacy Beige','Legacy Red','Legacy Antelope Brown',
+    'Leila Spice','Leila Red.Pattern','Leila Black','Leila Chocolate','Leila Red',
+    'Leila Beige','Leila Grey','Leila Cracked','Leila Dark Brown',
+    'Liam Black','Liam Brown','Liam Nude','Liam Green','Liam Grey','Liam Red',
+    'Lite Black/Brown','Lite Brown/Black','Lite Grey/Black','Lite Nude/Black','Lite Green/Black',
+    'Lola Yellow Brown','Lola Red.Pattern','Lola Wooven Black','Lola Wooven Maroon',
+    'Lola Wooven Mustard','Lola Wooven Purple','Lola Grey','Lola Choco','Lola Cracked',
+    'Lola Red','Lola Black','Lola Spice','Lola Beige','Lola Maroon','Lola Dark Brown',
+    'Loop Bp Cn Black','Loop Bp Spice','Loop Bp Cracked','Loop Bp Beige','Loop Bp Maroon',
+    'Loop Bp Green','Loop Bp Cn Grey','Loop Bp Red','Loop Bp Dark Brown','Loop Bp Cn Dark Brown',
+    'Lotus Grey','Lotus Cracked','Lotus Spice','Lotus Beige','Lotus Black','Lotus Red',
+    'Lotus Dark Brown','Lotus Choco',
+    'Luca Black','Luca Nude','Luca Brown','Luca Yellow Dotted','Luca Green','Luca Grey',
+    'Luna Black','Luna Green','Luna Yellow Dotted','Luna Brown','Luna Nude','Luna Grey',
+    'Luna Amapiano Black','Luna Amapiano Green','Luna Amapiano Yellow Dotted',
+    'Luna Amapiano Brown','Luna Amapiano Nude','Luna Amapiano Grey',
+    'Lunchset Black','Lunchset Nude','Lunchset Brown','Lunchset Yellow Dotted',
+    'Lunchset Green','Lunchset Grey',
+    'Make Up Pouch Brown','Make Up Pouch Black','Make Up Pouch Yellow Dotted',
+    'Make Up Pouch Grey','Make Up Pouch Nude','Make Up Pouch Blue','Make Up Pouch Green',
+    'Man Bag Black','Man Bag Brown','Man Bag Nude','Man Bag Grey','Man Bag Green',
+    'Man Bag Yellow Dotted','Man Bag Red','Man Bag Blue',
+    'Mandy Hb Black','Mandy Hb Spice','Mandy Hb Cracked','Mandy Hb Grey','Mandy Hb Choco',
+    'Mandy Hb Beige','Mandy Hb Yellow Brown','Mandy Hb Dark Brown','Mandy Hb Red',
+    'Marley Beige','Marley Black','Marley Maroon','Marley Dark Brown',
+    'Maya Mustard','Maya Red.Pattern','Maya Wooven Black','Maya Wooven Maroon',
+    'Maya Wooven Mustard','Maya Wooven Purple','Maya Black','Maya Pink','Maya Mint Green',
+    'Maya Brown','Maya Lilac','Maya Blue',
+    'Mega Black','Mega Brown','Mega Grey','Mega Nude','Mega Green','Mega Yellow Dotted',
+    'Mini Manbag Grey','Mini Manbag Black','Mini Manbag Cracked','Mini Manbag Beige',
+    'Mini Manbag Red','Mini Manbag Spice','Mini Manbag Chocolate','Mini Manbag Yellow Brown',
+    'Mini Manbag Dark Brown',
+    'Mini Maya Wooven Mustard','Mini Maya Red.Pattern','Mini Maya Wooven Black',
+    'Mini Maya Wooven Purple','Mini Maya Wooven Maroon',
+    'Mini School Black','Mini School Grey','Mini School Brown','Mini School Red',
+    'Mini School Green','Mini School Nude',
+    'Mini Umbra Black','Mini Umbra Grey','Mini Umbra Cracked','Mini Umbra Spice',
+    'Mini Umbra Manyatta Dark Brown','Mini Umbra Manyatta Dark Green','Mini Umbra Manyatta Green',
+    'Mini Umbra Manyatta Yellow','Mini Umbra Beige','Mini Umbra Dark brown','Mini Umbra Red',
+    'Mini Umbra Yellow Brown','Mini Umbra Chocolate',
+    'Mini Zuri Grey','Mini Zuri Wooven Black','Mini Zuri Wooven Maroon','Mini Zuri Wooven Mustard',
+    'Mini Zuri Wooven Purple','Mini Zuri Black','Mini Zuri Beige','Mini Zuri Red',
+    'Mini Zuri Spice','Mini Zuri Cracked','Mini Zuri Maroon','Mini Zuri Amber Brown',
+    'Mini Zuri Yellow Brown','Mini Zuri Chocolate','Mini Zuri Red P','Mini Zuri Dark Brown',
+    'Modern Travel Grey','Modern Travel Green','Modern Travel Brown','Modern Travel Nude',
+    'Modern Travel Black','Modern Travel Yellow Dotted',
+    'Monah Bp Black','Monah Bp Spice','Monah Bp Cracked','Monah Bp Grey','Monah Bp Beige',
+    'Monah Bp Maroon','Monah Bp Choco','Monah Bp Dark Brown','Monah Bp Red',
+    'Montana Beige','Montana Black','Montana Choco','Montana Cracked','Montana Cream',
+    'Montana Dark Brown','Montana Green Tt','Montana Grey','Montana Red','Montana Spice',
+    'Moon Bag Spice','Moon Bag Red.Pattern','Moon Bag Wooven Black','Moon Bag Wooven Maroon',
+    'Moon Bag Wooven Mustard','Moon Bag Wooven Purple','Moon Bag Grey','Moon Bag Cracked',
+    'Moon Bag Black','Moon Bag Beige','Moon Bag Red','Moon Bag Yellow Brown',
+    'Moon Bag Chocolate Brown','Moon Bag Maroon','Moon Bag Amber Brown','Moon Bag Dark Brown',
+    'Mradi Travel Black','Mradi Travel Brown','Mradi Travel Green','Mradi Travel Yellow Dotted',
+    'Mradi Travel Grey','Mradi Travel Nude',
+    'Mystique Grey','Mystique Black','Mystique Cracked','Mystique Beige','Mystique Red',
+    'Mystique Spice','Mystique Chocolate','Mystique Yellow Brown','Mystique Dark Brown',
+    'Nala Black','Nala Blue','Nala Red','Nala Green',
+    'Neo Man Black','Neo Man Grey','Neo Man Brown','Neo Man Green','Neo Man Nude',
+    'Neo Man Yellow Dotted',
+    'Nina Mustard','Nina Black','Nina Lilac','Nina Pink','Nina Blue','Nina Green',
+    'Nina Maroon','Nina Mint Green','Nina Brown',
+    'Nizana Black','Nizana Red.Pattern','Nizana Cracked','Nizana Spice','Nizana Grey',
+    'Nizana Beige','Nizana Choco','Nizana Yellow Brown','Nizana Red','Nizana Dark Brown',
+    'Nova Spice','Nova Grey','Nova Black','Nova Nude','Nova Cracked','Nova Chocolate',
+    'Nova Yellow Brown',
+    'Nyla Bp Black','Nyla Bp Brown','Nyla Bp Nude','Nyla Bp Grey','Nyla Bp Yellow Dotted',
+    'Nyla Bp Green',
+    'Oval Handbag Brown','Oval Handbag Wooven Black','Oval Handbag Wooven Maroon',
+    'Oval Handbag Wooven Mustard','Oval Handbag Wooven Purple','Oval Handbag Grey',
+    'Oval Handbag Green','Oval Handbag Nude','Oval Handbag Black','Oval Handbag Red',
+    'Oval Handbag Red P','Oval Handbag Chocolate',
+    'Pioneer Black','Pioneer Brown','Pioneer Grey','Pioneer Nude','Pioneer Green',
+    'Pioneer Yellow Dotted',
+    'Pocket Travel Black','Pocket Travel Brown','Pocket Travel Nude','Pocket Travel Yellow Dotted',
+    'Pocket Travel Green','Pocket Travel Grey',
+    'POH Hairistic Spice','POH Hairistic Grey','POH Hairistic Brown','POH Hairistic Cracked',
+    'POH Hairistic Red','POH Hairistic Choco','POH Hairistic Black',
+    'Prime Black','Prime Brown','Prime Nude','Prime Grey','Prime Yellow Dotted',
+    'Prime Green','Prime Red',
+    'Reesto Chest Grey','Reesto Chest Spice','Reesto Chest Cracked','Reesto Chest Beige',
+    'Reesto Chest Red','Reesto Chest Black','Reesto Chest Choco','Reesto Chest Dark Brown',
+    'Reesto Chest Yellow Brown',
+    'Remi Spice','Remi Dark Brown','Remi Black','Remi Beige','Remi Cracked','Remi Grey',
+    'Remi Red','Remi Yellow Brown','Remi Chocolate',
+    'Reo Travel Black','Reo Travel Brown','Reo Travel Nude','Reo Travel Grey',
+    'Reo Travel Yellow Dotted','Reo Travel Green',
+    'Roza Cracked','Roza Spice','Roza Grey','Roza Black','Roza Red','Roza Yellow Brown',
+    'Roza Chocolate','Roza Dark Brown','Roza Maroon','Roza Beige',
+    'Safiri Bp Black','Safiri Bp Brown','Safiri Bp Nude','Safiri Bp Grey','Safiri Bp Green',
+    'Safiri Travel Brown','Safiri Travel Black','Safiri Travel Grey','Safiri Travel Nude',
+    'Safiri Travel Yellow Dotted','Safiri Travel Crimson','Safiri Travel Green',
+    'Santana Mint Green','Santana Red.Pattern','Santana Black','Santana Mustard','Santana Lilac',
+    'Sarai Nude','Sarai Yellow Doted','Sarai Black','Sarai Green','Sarai Grey','Sarai Brown',
+    'Satchel Black','Satchel Grey','Satchel Spice','Satchel Cracked','Satchel Red',
+    'Satchel Beige','Satchel Wooven Black','Satchel Chocolate','Satchel Yellow Brown',
+    'Satis Black','Satis Cracked','Satis Spice','Satis Grey','Satis Red','Satis Beige',
+    'Satis Yellow Brown','Satis Amber','Satis D.Brown','Satis Chocolate',
+    'Savannah Sling Black','Savannah Sling Caramel','Savannah Sling Mustard',
+    'Savannah Sling Maroon','Savannah Sling Cream',
+    'Scarlet Black','Scarlet Croc.Pink','Scarlet Croc.Orange','Scarlet Croc.Mustard',
+    'Scarlet Croc.Brown',
+    'School Bag Black','School Bag Brown','School Bag Beige','School Bag Grey',
+    'School Bag Green','School Bag Blue',
+    'Scooby Black','Scooby Dark Brown','Scooby Spice','Scooby Grey','Scooby Red',
+    'Scooby Cracked','Scooby Choco','Scooby Beige',
+    'Shugli Backpack Brown','Shugli Backpack Black','Shugli Backpack Grey',
+    'Shugli Backpack Yellow Dotted','Shugli Backpack Green','Shugli Backpack Nude',
+    'Sierra Handbag Wooven Black','Sierra Handbag Wooven Cream','Sierra Handbag Wooven Maroon',
+    'Sierra Handbag Wooven Brown',
+    'Skye Hb Wooven Black','Skye HB Wooven Lilac','Skye Hb Wooven Maroon','Skye Hb Wooven Mustard',
+    'Sleeve 1 Caramel','Sleeve 1 Black','Sleeve 1 Brown','Sleeve 1 Green',
+    'Sleeve 2 Caramel','Sleeve 2 Black','Sleeve 2 Brown','Sleeve 2 Green',
+    'Spark Black','Spark Brown','Spark Grey','Spark Nude','Spark Green','Spark Yellow Dotted',
+    'Splash Backpack Black','SPlash Backpack Green','Splash Backpack Brown',
+    'Splash Backpack Beige','Splash Backpack Grey',
+    'Taji Black','Taji Maroon 018','Taji Dark Brown','Taji Beige','Taji Brown','Taji Green',
+    'Taji Red','Taji Blue','Taji Grey',
+    'Titan Travel Titan 1','Titan Travel Titan 15','Titan Travel Titan 5','Titan Travel Titan 14',
+    'Titan Travel Titan 11','Titan Travel Titan 3','Titan Travel Titan 6',
+    'Standard Travel Grey','Standard Travel Yellow Dotted','Standard Travel Nude',
+    'Standard Travel Brown','Standard Travel Black','Standard Travel Red',
+    'Standard Travel Blue','Standard Travel Green',
+    'Travolta Black','Travolta Dark Brown','Travolta Spice','Travolta Grey','Travolta Red',
+    'Travolta Cracked','Travolta Choco','Travolta Beige',
+    'Trecento Spice','Trecento Grey','Trecento Cracked','Trecento Black','Trecento Red',
+    'Trecento Wooven Maroon','Trecento Chocolate','Trecento Dark Brown','Trecento Red P',
+    'Trecento Beige',
+    'Trio Mio Black','Trio Mio Grey','Trio Mio Nude','Trio Mio Green','Trio Mio Brown',
+    'Twain Travel Grey','Twain Travel Beige','Twain Travel Red','Twain Travel Spice',
+    'Twain Travel Cracked','Twain Travel Yellow Brown','Twain Travel Chocolate',
+    'Twain Travel Dark Brown',
+    'Tyler Black','Tyler Yellow Dotted','Tyler Brown','Tyler Grey','Tyler Nude','Tyler Green',
+    'Umbra Cracked','Umbra Spice','Umbra Grey','Umbra Beige','Umbra Green','Umbra Red',
+    'Umbra Black','Umbra Dark Brown','Umbra Chocolate',
+    'Val Croc Orange','Val Croc Pink','Val Croc Brown','Val Black','Val Red','Val Croc Mustard',
+    'Vanity Spice','Vanity Dark Brown','Vanity Black','Vanity Beige','Vanity Cracked',
+    'Vanity Grey','Vanity Red','Vanity Yellow Brown','Vanity Amber','Vanity Maroon',
+    'Vanity Chocolate',
+    'Voyage Black','Voyage Brown','Voyage Green','Voyage Grey','Voyage Nude','Voyage Red',
+    'Voyage Blue','Voyage Yellow Dotted',
+    'Wander Luxe Pattern Pink','Wander Luxe Pattern Blue','Wander Luxe Pattern Red',
+    'Washbag Black','Washbag Brown','Washbag Nude','Washbag Grey','Washbag Yellow Dotted',
+    'Washbag Green',
+    'Yara Melon','Yara Mustard','Yara Blue','Yara Pink','Yara Brown','Yara Green','Yara Black',
+    'Zane Man Black','Zane Man Cracked','Zane Man Beige','Zane Man Spice','Zane Man Grey',
+    'Zane Man Chocolate','Zane Man Red','Zane Man Green','Zane Man Dark Brown',
+    'Zelus Black','Zelus Cracked','Zelus Beige','Zelus Spice','Zelus Grey','Zelus Chocolate',
+    'Zelus Dark Brown','Zelus Yellow Brown',
+    'Zeno Grey/Black','Zeno Spice/Black','Zeno Black/Grey','Zeno Cracked/Black',
+    'Zeno Yellow Brown','Zeno Chocolate/Black','Zeno Black/Red','Zeno Black/Cracked',
+    'Ziara Man Bag Brown','Ziara Man Bag Black','Ziara Man Bag Nude','Ziara Man Bag Green',
+    'Ziara Man Bag Yellow Dotted','Ziara Man Bag Grey',
+    'Zing Sling Black','Zing Sling Spice','Zing Sling Cracked','Zing Sling Grey',
+    'Zing Sling Yellow Brown','Zing Sling Chocolate','Zing Sling Red','Zing Sling Beige',
+    'Zing Sling Dark Brown',
+    'Zipped Lunchset Grey','Zipped Lunchset Brown','Zipped Lunchset Beige',
+    'Zipped Lunchset Black','Zipped Lunchset Yellow Dotted','Zipped Lunchset Green',
+    'Zoezi Brown','Zoezi Green','Zoezi Nude','Zoezi Black','Zoezi Grey','Zoezi Yellow Dotted',
+    'Zula Cn Black','Zula Cn Grey','Zula Antelope Brown','Zula Nude','Zula Green','Zula Red',
+    'Zula Black','Zula Yellow Dotted',
+    'Zuri Red','Zuri Red.Pattern','Zuri Beige','Zuri Black','Zuri Cracked','Zuri Spice',
+    'Zuri Chocolate','Zuri Yellow','Zuri Maroon','Zuri Amber','Zuri Grey','Zuri Dark Brown'
+  ]) WITH ORDINALITY AS t(name, ord)
+),
+
+-- Dedupe repeated masterfile names (keep first position)
+master_order AS (
+  SELECT DISTINCT ON (UPPER(TRIM(name)))
+    UPPER(TRIM(name)) AS product_key,
+    ord               AS sort_order
+  from master_order_raw
+  ORDER BY UPPER(TRIM(name)), ord
+),
+
+shop_sales AS (
+  SELECT
+    CASE
+      WHEN lower(pc."name") IN ('website sales','website','jumia') OR p.session_id IS NULL THEN 'WEBSITE'
+      WHEN lower(pc."name") IN ('sinza','dar-es-alam')             THEN 'SINZA'
+      WHEN lower(pc."name") IN ('ktda','ktda shop')                THEN 'KTDA'
+      ELSE UPPER(pc."name")
+    END AS shop,
+    COALESCE(pt."name", '<<unknown>>') AS product_name,
+    SUM(pl.qty) AS qty_sold
+  FROM pos_order p
+  JOIN pos_order_line pl ON pl.order_id = p.id
+  LEFT JOIN pos_session ps ON p.session_id = ps.id
+  LEFT JOIN pos_config pc ON ps.config_id = pc.id
+  LEFT JOIN product_product pp ON pl.product_id = pp.id
+  LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  LEFT JOIN product_category pcat ON pcat.id = pt.categ_id
+  CROSS JOIN date_range dr
+  WHERE p.date_order::date BETWEEN dr.start_date AND dr.end_date
+    AND p.state IN ('done', 'paid', 'invoiced')  -- as the Sales page counts them
+    AND COALESCE(pt."name", '') NOT ILIKE '%Delivery Fee%'
+    AND COALESCE(pt."name", '') NOT ILIKE '%KES discount%'
+    AND COALESCE(pcat."name", '') NOT ILIKE '%Pos%'
+    -- Refund lines carry a negative qty and a negative amount. Keeping
+    -- them nets returns off the day's takings, the way Odoo reports it;
+    -- excluding them reported gross sales and let a single mis-key stand
+    -- uncorrected (Eldoret keyed 777 Lola Black on 7 Sep 2026 and
+    -- reversed 776 an hour later, inflating that day by KES 1.4m).
+    AND pl.qty <> 0
+    -- Bags sold nets refunds: a bag sold and refunded is not a bag sold.
+    -- That is how the daily Bags Sold reports count (13-19 Sep 2026 match to
+    -- the bag), and every refund in September 2026 was rung the same day as
+    -- its sale, so netting by day and netting by sale agree. Counting refunds
+    -- as movements, as Odoo's dashboard does, put every refund in twice.
+    -- Straps and the rest of the accessories are not bags.
+    AND (COALESCE(pcat."name", '') ILIKE 'Bags%'
+         OR COALESCE(pt."name", '') ILIKE '%Gift Bag%')
+    -- Combo containers, including refunded ones (a refund line does not
+    -- carry is_combo_line): the bags inside are counted on their own lines.
+    AND COALESCE(pl.is_combo_line, FALSE) = FALSE
+    AND COALESCE(pt.is_combo, FALSE) = FALSE
+    -- A combo/bundle line ("Jumbo + Prime Combo", "Buy Baby Bag Get Liam
+    -- Travel Free") is a pricing container, not a bag itself — Odoo already
+    -- records the actual bag(s) inside it as separate, normally-named
+    -- sub_product_line rows (price 0, real product), which flow through
+    -- this same query on their own. Excluding by Odoo's own is_combo_line
+    -- flag catches every combo shape without parsing the bundle name.
+    AND COALESCE(pl.is_combo_line, FALSE) = FALSE
+    AND (p.session_id IS NULL OR COALESCE(pc."name", '') <> '')       -- shop locations only, not blank/production
+    AND (p.session_id IS NULL OR pc."name" NOT ILIKE '%Flash Sale%')
+  GROUP BY 1, 2
+  HAVING SUM(pl.qty) <> 0
+),
+
+tagged AS (
+  SELECT
+    ss.shop,
+    ss.product_name,
+    ss.qty_sold,
+    CASE WHEN mo.product_key IS NOT NULL THEN 0 ELSE 1 END AS section,
+    0 AS row_type
+  FROM shop_sales ss
+  LEFT JOIN master_order mo
+    ON mo.product_key = UPPER(TRIM(ss.product_name))
+),
+
+section_totals AS (
+  SELECT
+    '' AS shop,
+    CASE section
+      WHEN 0 THEN 'MASTERFILE TOTAL'
+      ELSE        'NON-MASTERFILE TOTAL'
+    END AS product_name,
+    SUM(qty_sold) AS qty_sold,
+    section,
+    1 AS row_type
+  FROM tagged
+  GROUP BY section
+)
+
+SELECT
+  shop         AS "SHOP",
+  product_name AS "PRODUCT",
+  qty_sold     AS "QTY SOLD"
+FROM (
+  SELECT * FROM tagged
+  UNION ALL
+  SELECT * FROM section_totals
+) combined
+ORDER BY
+  section,
+  row_type,
+  qty_sold DESC,
+  product_name,
+  shop;
+"""
+
+# One row per sold order line: cleaned customer name/gender/phone, parsed
+# product + color, category, branch, and KES-normalized price/total.
+CUSTOMER_SALES = """
+WITH color_list(color) AS (
+    VALUES
+        -- Multi-word colors (longest match wins)
+        ('Black TT'),('Grey TT'),('Beige TT'),('Green TT'),
+        ('Wooven Black'),('Wooven Maroon'),('Wooven Mustard'),('Wooven Purple'),
+        ('Wooven Cream'),('Wooven Brown'),('Wooven Lilac'),
+        ('Croc Black'),('Croc Brown'),('Croc Mustard'),('Croc Orange'),('Croc Pink'),
+        ('Dark Brown'),('Mint Green'),('Yellow Brown'),('Yellow Dotted'),('Navy Blue'),
+        ('Antelope Brown'),
+        ('Red.Pattern'),('Red Pattern'),
+        ('Pattern Pink'),('Pattern Blue'),('Pattern Red'),
+        ('Amapiano Black'),('Amapiano Brown'),('Amapiano Grey'),('Amapiano Nude'),
+        ('Ankara Black'),('Ankara Brown'),('Ankara Grey'),('Ankara Nude'),
+        ('Black X Red'),
+        ('Beige/Red'),('Black/Cracked'),('Black/Red'),('Green/Red'),('Maroon/Red'),
+        ('Black/Beige'),('Black/Choco'),('Black/D.Brown'),('Black/Grey'),('Black/Spice'),
+        ('Red/Black'),('Grey/Black'),('Spice/Black'),('Cracked/Black'),('Chocolate/Black'),
+        ('Black 018'),('Beige 018'),('Dark Brown 018'),('Maroon 018'),
+        ('Titan 1'),('Titan 3'),('Titan 5'),('Titan 6'),('Titan 11'),('Titan 14'),('Titan 15'),
+        ('Goyard 5'),
+        ('Start 20'),('Start 4'),('Start 8'),
+        ('Red P'),('Black B'),('N.Blue'),('D.Brown'),
+        ('Manyatta Dark Brown'),('Manyatta Dark Green'),('Manyatta Green'),('Manyatta Yellow'),
+        ('CN Black'),('CN Grey'),('CN Dark Brown'),
+        ('A3 Red'),('A3 Pink'),
+        ('A4 Red'),('A4 Pink'),
+        ('A5 Red'),('A5 Pink'),
+        ('A3'),('A4'),('A5'),
+        ('Denim Blue'),('Wine Red'),('Crimson'),
+        ('Beige'),('Black'),('Blue'),('Brown'),('Chocolate'),('Choco'),
+        ('Cracked'),('Green'),('green'),('GREEN'),('Grey'),('Gold'),('Lilac'),('Maroon'),
+        ('Mustard'),('Nude'),('Orange'),('Pink'),('Purple'),
+        ('Red'),('Spice'),('White'),('Yellow')
+),
+
+product_color_split AS (
+    SELECT
+        pt.id AS product_tmpl_id,
+        pt.name AS full_name,
+        (
+            SELECT cl.color
+            FROM color_list cl
+            WHERE pt.name LIKE '% ' || cl.color
+               OR pt.name = cl.color
+            ORDER BY LENGTH(cl.color) DESC
+            LIMIT 1
+        ) AS matched_color
+    FROM product_template pt
+),
+
+-- Gender now comes straight from res_partner.gender (added to the data-entry
+-- UI 2026-07-22) — this CTE only needs to produce the cleaned full name.
+-- The old first-name-based gender lookup lives on in Python (lib/gender.py)
+-- as a fallback for records with no gender recorded, and as a cross-check
+-- against what's recorded (lib.gender.find_mismatches).
+customer_name_split AS (
+    SELECT
+        rp.id,
+        INITCAP(
+            TRIM(
+                REGEXP_REPLACE(
+                    REGEXP_REPLACE(
+                        REGEXP_REPLACE(
+                            REGEXP_REPLACE(
+                                REGEXP_REPLACE(
+                                    rp.name,
+                                    '\\([^)]*\\)',
+                                    '', 'g'
+                                ),
+                                '(?i)\\s*(prepayment fulfilled|prepayment|sasapay|sasa pay|fullfilled|fulfilled|prepay|coop|I&M|ncba|cash|pdq)\\s*',
+                                ' ', 'g'
+                            ),
+                            '[",;:'']',
+                            '', 'g'
+                        ),
+                        '\\s+[A-Z]\\s+',
+                        ' ', 'g'
+                    ),
+                    '\\s{2,}',
+                    ' ', 'g'
+                )
+            )
+        ) AS full_name
+    FROM res_partner rp
+),
+
+-- What was later handed back against each sale line. Every refund line in
+-- Odoo points at the line it reverses, so a sale can be shown net of its
+-- returns rather than as a purchase next to a separate -1 row.
+refunded AS (
+    SELECT
+        r.refunded_orderline_id     AS line_id,
+        SUM(r.qty)                  AS qty,
+        SUM(r.price_subtotal_incl)  AS amount
+    FROM pos_order_line r
+    WHERE r.refunded_orderline_id IS NOT NULL
+    GROUP BY r.refunded_orderline_id
+)
+,
+
+-- One row per sale line, net of its refunds. Aggregated below.
+line_rows AS (
+SELECT
+    po.id                                                           AS order_id,
+    pol.product_id                                                  AS product_id,
+    po.date_order                                                   AS ordered_at,
+    po.date_order::DATE                                             AS "Date",
+
+    -- Name (full customer name)
+    CASE
+        WHEN TRIM(cns.full_name) = '' OR cns.full_name IS NULL
+            THEN 'N/A'
+        ELSE cns.full_name
+    END                                                             AS "Name",
+    -- As typed at the till; the page cleans it (lib.names), which can recover
+    -- a name the SQL clean-up above drops, e.g. "KCB (Emily)".
+    rp.name                                                         AS "Raw Name",
+
+    -- Gender — direct from partner record (male / female / corporate / blank)
+    COALESCE(INITCAP(NULLIF(TRIM(rp.gender), '')), 'N/A')           AS "Gender",
+
+    -- Phone (clean special characters, return N/A if empty)
+    CASE
+        WHEN TRIM(
+            CASE
+                WHEN rp.phone ~ '^\+?(254|256|255)'
+                    THEN '0' || REGEXP_REPLACE(rp.phone, '^\+?(254|256|255)', '')
+                ELSE rp.phone
+            END
+        ) = '' OR rp.phone IS NULL
+            THEN 'N/A'
+        ELSE TRIM(
+            REGEXP_REPLACE(
+                CASE
+                    WHEN rp.phone ~ '^\+?(254|256|255)'
+                        THEN '0' || REGEXP_REPLACE(rp.phone, '^\+?(254|256|255)', '')
+                    ELSE rp.phone
+                END,
+                '[^0-9+]', '', 'g'
+            )
+        )
+    END                                                             AS "Phone",
+
+    -- Product (remove discount text and color suffix)
+    CASE
+        WHEN pcs.matched_color IS NULL
+            THEN TRIM(REGEXP_REPLACE(pcs.full_name, '^\d+(\.\d+)?\s*KES\s+discount.*$', '', 'i'))
+        WHEN pcs.full_name = pcs.matched_color
+            THEN pcs.full_name
+        ELSE TRIM(REGEXP_REPLACE(
+                LEFT(
+                    pcs.full_name,
+                    LENGTH(pcs.full_name) - LENGTH(pcs.matched_color)
+                ),
+                '^\d+(\.\d+)?\s*KES\s+discount.*$', '', 'i'
+            ))
+    END                                                             AS "Product",
+
+    -- Color
+    CASE
+        WHEN pcs.matched_color IS NULL THEN 'Combo'
+        ELSE pcs.matched_color
+    END                                                             AS "Color",
+
+    -- Category
+    CASE
+        WHEN pc.name = 'All' THEN 'Combo'
+        ELSE TRIM(REGEXP_REPLACE(pc.name, '^[^/]+/\s*', ''))
+    END                                                             AS "Category",
+
+    -- Location
+    CASE
+        -- The staff till sells out of the Accessories & Materials Store
+        -- location, so it is named by its till, not its stock location.
+        WHEN lower(pconf.name) = 'staff pos'
+            THEN 'Staff POS'
+        WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%'
+            THEN 'Sinza'
+        ELSE INITCAP(
+                TRIM(REGEXP_REPLACE(
+                    COALESCE(sw.name, sl.complete_name, 'N/A'),
+                    '\s*Shop\s*', '', 'gi'
+                ))
+            )
+    END                                                             AS "Location",
+
+    -- Unit Price (price per item)
+    ROUND(
+        (pol.price_subtotal_incl / COALESCE(NULLIF(po.currency_rate, 0), 1))
+            / NULLIF(pol.qty, 0),
+        2
+    )                                                               AS "Price",
+
+    -- Quantity, net of anything later refunded against this line
+    pol.qty + COALESCE(ref.qty, 0)                                  AS "Quantity",
+
+    -- Total (Price * Quantity)
+    ROUND(
+        (pol.price_subtotal_incl + COALESCE(ref.amount, 0))
+            / COALESCE(NULLIF(po.currency_rate, 0), 1),
+        2
+    )                                                               AS "Total",
+
+    -- Customer Type
+    COALESCE(po.customer_type, 'N/A')                              AS "Customer Type"
+
+FROM pos_order po
+
+LEFT JOIN res_partner          rp    ON rp.id    = po.partner_id
+LEFT JOIN customer_name_split  cns   ON cns.id   = rp.id
+LEFT JOIN pos_order_line       pol   ON pol.order_id = po.id
+LEFT JOIN refunded             ref   ON ref.line_id = pol.id
+LEFT JOIN product_product      pp    ON pp.id    = pol.product_id
+LEFT JOIN product_template     pt    ON pt.id    = pp.product_tmpl_id
+LEFT JOIN product_color_split  pcs   ON pcs.product_tmpl_id = pt.id
+LEFT JOIN product_category     pc    ON pc.id    = pt.categ_id
+LEFT JOIN pos_session          ps    ON ps.id    = po.session_id
+LEFT JOIN pos_config           pconf ON pconf.id = ps.config_id
+LEFT JOIN stock_picking_type   spt   ON spt.id   = pconf.picking_type_id
+LEFT JOIN stock_warehouse      sw    ON sw.id    = spt.warehouse_id
+LEFT JOIN stock_location       sl    ON sl.id    = spt.default_location_src_id
+
+WHERE
+    po.state IN ('done', 'paid')
+    AND pt.name NOT ILIKE '%Delivery Fee%'
+    AND pt.name NOT ILIKE '%Gift Bag%'
+    AND pc.name NOT ILIKE '%Pos%'
+    -- A customer list shows purchases, so refund lines (negative qty) are
+    -- left out. Dropping them alone is not enough: the sale each one
+    -- reversed would then stand at full value, and mis-keys are refunded
+    -- this way (Kakamega keyed KES 11,998,820 on 12 Sep 2026 and refunded
+    -- it four minutes later). Sales are shown net of their refunds, and a
+    -- sale refunded in full disappears with its refund.
+    AND pol.qty > 0
+    AND pol.qty + COALESCE(ref.qty, 0) > 0
+    AND pt.name NOT ILIKE '%KES discount%'
+    AND (COALESCE(sw.name, sl.complete_name) NOT ILIKE '%Accessories%'  -- shop locations only, not production
+         OR lower(pconf.name) = 'staff pos')
+    AND COALESCE(sw.name, sl.complete_name) NOT ILIKE '%Flash Sale%'
+    AND po.date_order >= CAST(:start_date AS TIMESTAMP)
+    AND po.date_order < CAST(:end_date AS TIMESTAMP) + INTERVAL '1 day'
+
+)
+
+-- Odoo can hold one purchase as several lines — the website till keyed
+-- 22 Mini Umbra Beige as 22 one-unit lines on a single order (WEBSITE
+-- SALES/29213, 16 Sep 2026). A customer list reads that as one purchase
+-- of 22, so lines are combined per order and product.
+SELECT
+    "Date", "Name", "Raw Name", "Gender", "Phone", "Product", "Color", "Category", "Location",
+    ROUND(SUM("Total") / NULLIF(SUM("Quantity"), 0), 2)            AS "Price",
+    SUM("Quantity")                                                 AS "Quantity",
+    SUM("Total")                                                    AS "Total",
+    "Customer Type"
+FROM line_rows
+GROUP BY
+    order_id, product_id,
+    "Date", "Name", "Raw Name", "Gender", "Phone", "Product", "Color", "Category",
+    "Location", "Customer Type"
+ORDER BY MAX(ordered_at) DESC;
+"""
+PRODUCTION_BREAKDOWN = """
+WITH date_range AS (
+    SELECT
+        CAST(:start_date AS DATE) AS start_date,
+        CAST(:end_date AS DATE) AS end_date
+),
+
+breakdown AS (
+
+    -- 1. Materials Used (by material product)
+    SELECT
+        1 AS metric_order,
+        'Materials Used' AS metric,
+        pt.name AS product,
+        SUM(dro.material_required_qty) AS quantity
+    FROM denri_drawing_order dro
+    LEFT JOIN product_product  pp ON pp.id = dro.material_product_id
+    LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id,
+    date_range dr
+    WHERE dro.draw_date BETWEEN dr.start_date AND dr.end_date
+      AND dro.state = 'confirmed'
+      AND COALESCE(dro.material_required_qty, 0) <> 0
+    GROUP BY pt.name
+
+    UNION ALL
+
+    -- 2. Bags Drawn (by bag product)
+    SELECT
+        2, 'Bags Drawn',
+        pt.name,
+        SUM(dro.total_bags_drawn)
+    FROM denri_drawing_order dro
+    LEFT JOIN product_product  pp ON pp.id = dro.bag_product_id
+    LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id,
+    date_range dr
+    WHERE dro.draw_date BETWEEN dr.start_date AND dr.end_date
+      AND dro.state = 'confirmed'
+      AND COALESCE(dro.total_bags_drawn, 0) <> 0
+    GROUP BY pt.name
+
+    UNION ALL
+
+    -- 3. Bags Cut (by bag product)
+    SELECT
+        3, 'Bags Cut',
+        pt.name,
+        SUM(cb.qty_cut)
+    FROM denri_cut_batch cb
+    LEFT JOIN product_product  pp ON pp.id = cb.bag_product_id
+    LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id,
+    date_range dr
+    WHERE cb.cut_date BETWEEN dr.start_date AND dr.end_date
+      AND cb.cancelled_date IS NULL
+      AND COALESCE(cb.qty_cut, 0) <> 0
+    GROUP BY pt.name
+
+    UNION ALL
+
+    -- 4. Bags Issued (by product)
+    SELECT
+        4, 'Bags Issued',
+        pt.name,
+        SUM(bi.qty_issued)
+    FROM denri_bags_issued bi
+    LEFT JOIN product_product  pp ON pp.id = bi.product_id
+    LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id,
+    date_range dr
+    WHERE bi.issue_date BETWEEN dr.start_date AND dr.end_date
+      AND COALESCE(bi.active, TRUE) = TRUE
+      AND COALESCE(bi.is_return_job, FALSE) = FALSE
+      AND COALESCE(bi.is_rework, FALSE) = FALSE
+      AND COALESCE(bi.is_control_record, FALSE) = FALSE
+      AND COALESCE(bi.exclude_from_kpi, FALSE) = FALSE
+      AND COALESCE(bi.qty_issued, 0) <> 0
+    GROUP BY pt.name
+
+    UNION ALL
+
+    -- 5. WIP Created (by bag product)
+    SELECT
+        5, 'WIP Created',
+        pt.name,
+        SUM(wb.patterns_qty)
+    FROM denri_wip_batch wb
+    LEFT JOIN product_product  pp ON pp.id = wb.bag_product_id
+    LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id,
+    date_range dr
+    WHERE wb.wip_date BETWEEN dr.start_date AND dr.end_date
+      AND wb.cancelled_date IS NULL
+      AND COALESCE(wb.patterns_qty, 0) <> 0
+    GROUP BY pt.name
+
+    UNION ALL
+
+    -- 6. Bags Cut in Store = qty_balance_effective, in-store non-cancelled (live balance, no date filter)
+    SELECT
+        6, 'Bags Cut in Store',
+        pt.name,
+        SUM(cb.qty_balance_effective)
+    FROM denri_cut_batch cb
+    LEFT JOIN product_product  pp ON pp.id = cb.bag_product_id
+    LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id
+    WHERE cb.counts_in_store = TRUE
+      AND cb.cancelled_date IS NULL
+      AND COALESCE(cb.qty_balance_effective, 0) <> 0
+    GROUP BY pt.name
+
+    UNION ALL
+
+    -- 7. Repairs (pending total, shop-rows approximation)
+    SELECT
+        7, 'Repairs',
+        pt.name,
+        SUM(rp.qty)
+    FROM denri_dispatch_repair rp
+    LEFT JOIN product_product  pp ON pp.id = rp.product_id
+    LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id,
+    date_range dr
+    WHERE rp.report_date BETWEEN dr.start_date AND dr.end_date
+      AND COALESCE(rp.is_cancelled, FALSE) = FALSE
+      AND rp.shop_id IS NOT NULL
+      AND COALESCE(rp.qty, 0) <> 0
+    GROUP BY pt.name
+
+    UNION ALL
+
+    -- 8. Samples (by bag product)
+    SELECT
+        8, 'Samples',
+        pt.name,
+        SUM(dro.sample_bags_drawn)
+    FROM denri_drawing_order dro
+    LEFT JOIN product_product  pp ON pp.id = dro.bag_product_id
+    LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id,
+    date_range dr
+    WHERE dro.draw_date BETWEEN dr.start_date AND dr.end_date
+      AND dro.state = 'confirmed'
+      AND COALESCE(dro.sample_bags_drawn, 0) <> 0
+    GROUP BY pt.name
+)
+
+SELECT
+    metric_order,
+    metric                       AS "Metric",
+    COALESCE(product, 'N/A')     AS "Product",
+    ROUND(quantity::NUMERIC, 2)  AS "Quantity"
+FROM breakdown
+ORDER BY metric_order, "Quantity" DESC;
+"""
+
+# Retired: the international-channel transit report is now TRANSIT_BALANCE
+# (a stock_quant balance) plus SHOPS_RECEIVING_* (dispatch-vs-receipt timing),
+# both further down this file, next to COMBINED_DISTRIBUTION.
+
+# Bags sold pivoted by category (bag style) x store, with per-category subtotal
+# rows and a grand total. Wide-format companion to PRODUCT_SALES_BY_SHOP.
+BAGS_SOLD_BY_CATEGORY = """
+WITH date_params AS (
+  SELECT
+    CAST(:start_date AS DATE) AS start_date,
+    CAST(:end_date AS DATE) AS end_date
+),
+
+lines AS (
+  SELECT
+    -- The " 018" style code merged away, as the daily Bags Sold report names
+    -- them: "Zula Black 018" is Zula Black and "Trecento 018 Maroon" is
+    -- Trecento Maroon — the same bag on the shop floor under a second SKU.
+    TRIM(REGEXP_REPLACE(COALESCE(pt."name", '<<unknown>>'),
+                        '\s+018(\s|$)', '\\1'))    AS product_name,
+    -- Odoo's own category tree ("Bags / Travel Bags", "Bags / Backpacks", ...)
+    -- rather than a hand-maintained per-product-name list: picks up new
+    -- products automatically and groups by the actual bag type instead of
+    -- one category per product family. Gift Bag A3/A4/A5 (and their color
+    -- variants) live under Odoo's generic "All" category rather than a Bags
+    -- subcategory, so they're assigned by name here instead. "Accessories"
+    -- (buckles, zips, locks, rivets, adjusters, ...) is production/repair
+    -- component stock, not bags sold to customers, so it's dropped entirely,
+    -- straps included: a strap is an accessory, not a bag.
+    -- "All" is Odoo's uncategorized catch-all (stationery, samples, other
+    -- non-bag items) and is dropped the same way.
+    CASE
+        WHEN pt."name" ILIKE '%Gift Bag%' THEN 'Gift Bags'
+        WHEN COALESCE(pcat."name", '') IN ('Accessories', 'All') THEN ''
+        ELSE TRIM(REGEXP_REPLACE(COALESCE(pcat."name", ''), '^Bags\\s*/\\s*', ''))
+    END AS category,
+    pc."name" AS shop_name,
+    p.session_id AS session_id,
+    pl.qty AS bag_qty
+  FROM pos_order p
+  CROSS JOIN date_params dp
+  JOIN pos_order_line pl ON pl.order_id = p.id
+  LEFT JOIN pos_session ps ON p.session_id = ps.id
+  LEFT JOIN pos_config pc ON ps.config_id = pc.id
+  LEFT JOIN product_product pp ON pl.product_id = pp.id
+  LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  LEFT JOIN product_category pcat ON pcat.id = pt.categ_id
+  WHERE p.date_order::date BETWEEN dp.start_date AND dp.end_date
+    AND p.state IN ('done', 'paid', 'invoiced')  -- as the Sales page counts them
+    AND COALESCE(pt."name", '') NOT ILIKE '%Delivery Fee%'
+    AND COALESCE(pt."name", '') NOT ILIKE '%KES discount%'
+    AND COALESCE(pcat."name", '') NOT ILIKE '%Pos%'
+    -- Refund lines carry a negative qty and a negative amount. Keeping
+    -- them nets returns off the day's takings, the way Odoo reports it;
+    -- excluding them reported gross sales and let a single mis-key stand
+    -- uncorrected (Eldoret keyed 777 Lola Black on 7 Sep 2026 and
+    -- reversed 776 an hour later, inflating that day by KES 1.4m).
+    AND pl.qty <> 0
+    -- Bags sold nets refunds: a bag sold and refunded is not a bag sold.
+    -- That is how the daily Bags Sold reports count (13-19 Sep 2026 match to
+    -- the bag), and every refund in September 2026 was rung the same day as
+    -- its sale, so netting by day and netting by sale agree. Counting refunds
+    -- as movements, as Odoo's dashboard does, put every refund in twice.
+    -- A combo/bundle line ("Jumbo + Prime Combo", "Buy Baby Bag Get Liam
+    -- Travel Free") is a pricing container, not a bag itself — Odoo already
+    -- records the actual bag(s) inside it as separate, normally-named
+    -- sub_product_line rows (price 0, real product/category), which flow
+    -- through this same query on their own. So only the container line
+    -- needs excluding here; excluding by Odoo's own is_combo_line flag
+    -- catches every combo shape without needing to parse the bundle name.
+    AND COALESCE(pl.is_combo_line, FALSE) = FALSE
+    -- A refunded combo does not carry is_combo_line, so the container line
+    -- came back through as if it were a bag; the template flag catches it.
+    AND COALESCE(pt.is_combo, FALSE) = FALSE
+    -- Bags and gift bags only, the same rule the Sales page and By Shop use,
+    -- so the three never disagree: this drops "Saleable" (Foam Cleaner, gift
+    -- vouchers, sampling and customisation fees) along with the accessories.
+    AND (COALESCE(pcat."name", '') ILIKE 'Bags%'
+         OR COALESCE(pt."name", '') ILIKE '%Gift Bag%')
+    AND (p.session_id IS NULL OR COALESCE(pc."name", '') <> '')       -- shop locations only, not blank/production
+    AND (p.session_id IS NULL OR pc."name" NOT ILIKE '%Flash Sale%')
+),
+
+raw_sales AS (
+  SELECT
+    product_name,
+    category,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'starmall')     AS starmall,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'mombasa')      AS mombasa,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'nakuru')       AS nakuru,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'eldoret')      AS eldoret,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'kisumu')       AS kisumu,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'meru')         AS meru,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'thika')        AS thika,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'hazina')       AS hazina,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'kitengela')    AS kitengela,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) IN ('website sales','website') OR session_id IS NULL) AS website,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'jumia')        AS jumia,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'nanyuki')      AS nanyuki,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'nyeri')      AS nyeri,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'kakamega')     AS kakamega,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'hilton')       AS hilton,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) IN ('sinza','dar-es-alam')) AS sinza,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'uganda')       AS uganda,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'kisii')        AS kisii,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) IN ('ktda','ktda shop')) AS ktda,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'busia')        AS busia,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'rongai')       AS rongai,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'marketing')    AS mrkt,
+    SUM(bag_qty) FILTER (WHERE lower(shop_name) = 'staff pos')    AS staff_pos,
+    SUM(bag_qty) AS total
+  FROM lines
+  GROUP BY product_name, category
+),
+
+product_details AS (
+  SELECT
+    product_name AS bag_name,
+    starmall, mombasa, nakuru, eldoret, kisumu, meru, thika,
+    hazina, kitengela, website, jumia, nanyuki, nyeri, kakamega, hilton, sinza,
+    uganda, kisii, ktda, busia, rongai, mrkt, staff_pos, total,
+    category,
+    0 AS sort_priority
+  FROM raw_sales
+  WHERE category <> ''
+),
+
+category_totals AS (
+  SELECT
+    category || ' Total' AS bag_name,
+    SUM(starmall) AS starmall,
+    SUM(mombasa) AS mombasa,
+    SUM(nakuru) AS nakuru,
+    SUM(eldoret) AS eldoret,
+    SUM(kisumu) AS kisumu,
+    SUM(meru) AS meru,
+    SUM(thika) AS thika,
+    SUM(hazina) AS hazina,
+    SUM(kitengela) AS kitengela,
+    SUM(website) AS website,
+    SUM(jumia) AS jumia,
+    SUM(nanyuki) AS nanyuki,
+    SUM(nyeri) AS nyeri,
+    SUM(kakamega) AS kakamega,
+    SUM(hilton) AS hilton,
+    SUM(sinza) AS sinza,
+    SUM(uganda) AS uganda,
+    SUM(kisii) AS kisii,
+    SUM(ktda) AS ktda,
+    SUM(busia) AS busia,
+    SUM(rongai) AS rongai,
+    SUM(mrkt) AS mrkt,
+    SUM(staff_pos) AS staff_pos,
+    SUM(total) AS total,
+    category,
+    1 AS sort_priority
+  FROM raw_sales
+  WHERE category <> ''
+  GROUP BY category
+),
+
+grand_total AS (
+  SELECT
+    'GRAND TOTAL' AS bag_name,
+    SUM(starmall) AS starmall,
+    SUM(mombasa) AS mombasa,
+    SUM(nakuru) AS nakuru,
+    SUM(eldoret) AS eldoret,
+    SUM(kisumu) AS kisumu,
+    SUM(meru) AS meru,
+    SUM(thika) AS thika,
+    SUM(hazina) AS hazina,
+    SUM(kitengela) AS kitengela,
+    SUM(website) AS website,
+    SUM(jumia) AS jumia,
+    SUM(nanyuki) AS nanyuki,
+    SUM(nyeri) AS nyeri,
+    SUM(kakamega) AS kakamega,
+    SUM(hilton) AS hilton,
+    SUM(sinza) AS sinza,
+    SUM(uganda) AS uganda,
+    SUM(kisii) AS kisii,
+    SUM(ktda) AS ktda,
+    SUM(busia) AS busia,
+    SUM(rongai) AS rongai,
+    SUM(mrkt) AS mrkt,
+    SUM(staff_pos) AS staff_pos,
+    SUM(total) AS total,
+    NULL AS category,
+    2 AS sort_priority
+  FROM category_totals
+)
+
+SELECT
+  bag_name AS "Bag",
+  COALESCE(starmall, 0) AS "STARMALL",
+  COALESCE(mombasa, 0)  AS "MOMBASA",
+  COALESCE(nakuru, 0)   AS "NAKURU",
+  COALESCE(eldoret, 0)  AS "ELDORET",
+  COALESCE(kisumu, 0)   AS "KISUMU",
+  COALESCE(meru, 0)     AS "MERU",
+  COALESCE(thika, 0)    AS "THIKA",
+  COALESCE(hazina, 0)   AS "HAZINA",
+  COALESCE(kitengela, 0)AS "KITENGELA",
+  COALESCE(website, 0)  AS "WEBSITE",
+  COALESCE(jumia, 0)    AS "JUMIA",
+  COALESCE(nanyuki, 0)  AS "NANYUKI",
+  COALESCE(nyeri, 0)  AS "NYERI",
+  COALESCE(kakamega, 0) AS "KAKAMEGA",
+  COALESCE(hilton, 0)   AS "HILTON",
+  COALESCE(sinza, 0)    AS "SINZA",
+  COALESCE(uganda, 0)   AS "UGANDA",
+  COALESCE(kisii, 0)    AS "KISII",
+  COALESCE(ktda, 0)     AS "KTDA",
+  COALESCE(busia, 0)    AS "BUSIA",
+  COALESCE(rongai, 0)   AS "RONGAI",
+  COALESCE(mrkt, 0)     AS "MRKT",
+  COALESCE(staff_pos, 0) AS "STAFF POS",
+  COALESCE(total, 0)    AS "TOTAL",
+  category              AS "Category",
+  sort_priority
+FROM (
+  SELECT * FROM product_details
+  UNION ALL
+  SELECT * FROM category_totals
+  UNION ALL
+  SELECT * FROM grand_total
+) combined
+ORDER BY category, sort_priority;
+"""
+
+# One row per SHOP + PRODUCT with money sold (not units): SALES AMOUNT is
+# untaxed (price_subtotal), TOTAL SALES is tax-inclusive (price_subtotal_incl),
+# ACTUAL SALES applies the Uganda/Sinza currency conversion. Masterfile
+# products (incl. combos) first, then non-masterfile, each block by TOTAL
+# SALES descending.
+PRODUCT_SALES_VALUE_BY_SHOP = """
+WITH date_range AS (
+  SELECT
+    CAST(:start_date AS DATE) AS start_date,
+    CAST(:end_date AS DATE) AS end_date
+),
+
+master_order_raw AS (
+  SELECT name, ord
+  FROM UNNEST(ARRAY[
+    'Ace Croc Brown','Ace Red','Ace Beige','Ace Black TT','Ace Cracked',
+    'Ace Spice','Ace Chocolate','Ace Grey','Ace Dark Brown','Ace Red.Pattern',
+    'Ace Mustard','Ace Croc Pink','Ace Croc Orange','Ace Croc Mustard','Ace Blue',
+    'Ace Pink','Ace Brown','Ace Lilac','Ace Mint Green','Ace Green','Ace Croc Black',
+    'Adrian Black','Adrian Y.Dotted','Adrian Green','Adrian Grey','Adrian Nude','Adrian Brown',
+    'Alpha Travel Black','Alpha Travel Brown','Alpha Travel Nude','Alpha Travel Grey',
+    'Alpha Travel Yellow Dotted','Alpha Travel Green',
+    'Amari Black/Cracked','Amari Black/Yellow','Amari Black/Beige','Amari Black/Grey',
+    'Amari Black/D.Brown','Amari Black/Spice','Amari Black/Red','Amari Black/Choco',
+    'Amaya Black Tt','Amaya Spice','Amaya Cracked','Amaya Grey','Amaya Beige',
+    'Amaya Choco','Amaya Dark Brown','Amaya Red','Amaya Croc Black','Amaya Wooven Black',
+    'Amaya Wooven Maroon','Amaya Wooven Mustard','Amaya Wooven Purple','Amaya Green',
+    'Amaya Lilac','Amaya Mustard',
+    'Amora Black','Amora Red','Amora Pink','Amora Blue','Amora Green','Amora Mustard',
+    'Amora Maroon','Amora Purple',
+    'Ana Croc Mustard','Ana Croc Orange','Ana Croc Brown','Ana Croc Pink','Ana Blue',
+    'Ana Pink','Ana Mustard','Ana Brown','Ana Green','Ana Red P','Ana Black',
+    'Ankara Travel Black','Ankara Travel White','Ankara Travel Grey','Ankara Travel Nude',
+    'Ankara Travel Brown',
+    'Antitheft Black','Antitheft Brown','Antitheft Nude','Antitheft Grey',
+    'Antitheft Antelope Brown','Antitheft Green','Antitheft Cn Black',
+    'Aria Pro Red','Aria Pro Beige','Aria Pro Black','Aria Pro Cracked','Aria Pro Spice',
+    'Aria Pro Chocolate','Aria Pro Yellow','Aria Pro Maroon','Aria Pro Amber',
+    'Aria Pro Grey','Aria Pro Dark Brown',
+    'Aria Sling Red','Aria Sling Beige','Aria Sling Black','Aria Sling Cracked',
+    'Aria Sling Spice','Aria Sling Chocolate','Aria Sling Yellow','Aria Sling Maroon',
+    'Aria Sling Amber','Aria Sling Grey','Aria Sling Dark Brown',
+    'Arlo Man Bag Red','Arlo Man Bag Beige','Arlo Man Bag Black','Arlo Man Bag Cracked',
+    'Arlo Man Bag Spice','Arlo Man Bag Chocolate','Arlo Man Bag Yellow','Arlo Man Bag Maroon',
+    'Arlo Man Bag Amber','Arlo Man Bag Grey','Arlo Man Bag Dark Brown',
+    'Arm Band Spice','Arm Band Dark Brown','Arm Band Black','Arm Band Beige',
+    'Arm Band Cracked','Arm Band Grey','Arm Band Red','Arm Band Chocolate',
+    'Atlas Spice','Atlas Dark Brown','Atlas Black','Atlas Beige','Atlas Cracked',
+    'Atlas Grey','Atlas Red','Atlas Yellow Brown','Atlas Chocolate',
+    'Aurora Spice','Aurora Red.Pattern','Aurora Dark Brown','Aurora Black','Aurora Beige',
+    'Aurora Cracked','Aurora Grey','Aurora Red','Aurora Wooven Maroon','Aurora Wooven Black',
+    'Aurora Chocolate',
+    'Avana Hb Spice','Avana Hb Wooven Black','Avana Hb Wooven Maroon','Avana Hb Wooven Mustard',
+    'Avana Hb Wooven Purple','Avana Hb Dark Brown','Avana Hb Black','Avana Hb Beige',
+    'Avana Hb Cracked','Avana Hb Grey','Avana Hb Red','Avana Hb Yellow Brown',
+    'Avana Hb Amber','Avana Hb Maroon','Avana Hb Red P','Avana Hb Chocolate',
+    'Baby Bag Grey','Baby Bag Black','Baby Bag Nude','Baby Bag Brown','Baby Bag Green',
+    'Baby Bag Yellow Dotted',
+    'Bello Spice','Bello Cracked','Bello Black','Bello Grey','Bello Red','Bello Yellow',
+    'Bello Chocolate','Bello Beige',
+    'Belt Bag Black','Belt Bag Red','Belt Bag Cracked','Belt Bag Spice','Belt Bag Yellow',
+    'Belt Bag Nude','Belt Bag Grey','Belt Bag Chocolate','Belt Bag Dark Brown',
+    'Big Man Bag Black','Big Man Bag Brown','Big Man Bag Grey','Big Man Bag Nude',
+    'Big Man Bag Yellow Dotted','Big Man Bag Green',
+    'Bliss Chest Black','Bliss Chest Grey',
+    'Bonita Black','Bonita Cracked','Bonita Beige','Bonita Spice','Bonita Grey',
+    'Bonita Red','Bonita Yellow','Bonita Choco','Bonita D.Brown',
+    'Brief Case Brown','Brief Case Black','Brief Case Grey','Brief Case Nude','Brief Case Green',
+    'Butterfly Sling Cracked','Butterfly Sling Spice','Butterfly Sling Grey',
+    'Butterfly Sling Beige','Butterfly Sling Black','Butterfly Sling Red',
+    'Butterfly Sling Chocolate','Butterfly Sling Dark Brown','Butterfly Sling Yellow Brown',
+    'Cairo Bp Cracked','Cairo Bp Spice','Cairo Bp Beige','Cairo Bp Black','Cairo Bp Grey',
+    'Cairo Bp Red','Cairo Bp Dark Brown','Cairo Bp Yellow Brown','Cairo Bp Chocolate',
+    'Callista Cracked','Callista Spice','Callista Beige','Callista Black','Callista Grey',
+    'Callista Red','Callista Dark Brown','Callista Chocolate',
+    'Cathy Handbag Black','Cathy Handbag Spice','Cathy Handbag Cracked','Cathy Handbag Grey',
+    'Cathy Handbag Dark Brown','Cathy Handbag Beige','Cathy Handbag Red','Cathy Handbag Chocolate',
+    'Celine Sling Bag Black','Celine Sling Bag Spice','Celine Sling Bag Cracked',
+    'Celine Sling Bag Grey','Celine Sling Bag Beige','Celine Sling Bag Choco',
+    'Celine Sling Bag Dark Brown','Celine Sling Bag Red',
+    'Cess Hb Black','Cess Hb Spice','Cess Hb Cracked','Cess Hb Grey','Cess Hb Beige',
+    'Cess Hb Green','Cess Hb Choco','Cess Hb Dark Brown','Cess Hb Red',
+    'Charlotte Pink','Charlotte Black','Charlotte Brown','Charlotte Green','Charlotte Mustard',
+    'Charlotte Croc Mustard','Charlotte Croc Orange','Charlotte Croc Brown','Charlotte Croc Pink',
+    'Charlotte Grey','Charlotte Beige','Charlotte Dark Brown','Charlotte Cracked',
+    'Charlotte Red','Charlotte Spice','Charlotte Chocolate','Charlotte Blue',
+    'Chase Black','Chase Brown','Chase Grey','Chase Green','Chase Nude',
+    'Claire Handbag Black','Claire Handbag Spice','Claire Handbag Cracked','Claire Handbag Grey',
+    'Claire Handbag Wooven Maroon','Claire Handbag Wooven Black','Claire Handbag White','Claire Handbag Beige',
+    'Claire Handbag Dark Brown','Claire Handbag Red',
+    'Cleo Cracked','Cleo Grey','Cleo Black','Cleo Spice','Cleo Red','Cleo Chocolate',
+    'Cleo Yellow Brown','Cleo Dark Brown','Cleo Beige',
+    'Code 3 Nude','Code 3 Brown','Code 3 Black','Code 3 Grey','Code 3 Antelope Brown',
+    'Code 3 Green','Code 3 Blue','Code 3 Crimson',
+    'Code 4 Ankara Nude','Code 4 Ankara Green','Code 4 Ankara Brown','Code 4 Ankara Grey',
+    'Code 4 Ankara White','Code 4 Ankara Black',
+    'Code 9 Black','Code 9 Brown','Code 9 Green','Code 9 Yellow Dotted','Code 9 Grey','Code 9 Nude',
+    'College Hb Brown','College Hb Green','College Hb Black','College Hb Grey',
+    'College Hb Nude','College Hb Yellow Dotted',
+    'Cosmo Brown','Cosmo Green','Cosmo Black','Cosmo Grey','Cosmo Nude','Cosmo Yellow Dotted',
+    'Daria Chocolate','Daria Grey','Daria Cracked','Daria Dark Brown','Daria Black',
+    'Daria Spice','Daria Beige',
+    'Delica Black','Delica Red.Pattern','Delica Lilac','Delica Mustard','Delica Mint Green',
+    'Diaper Bag Titan 15','Diaper Bag Titan 11','Diaper Bag Titan 5','Diaper Bag Titan 6',
+    'Diaper Bag Pattern Blue','Diaper Bag Pattern Red','Diaper Bag Pattern Pink',
+    'Don Black','Don Brown','Don Nude','Don Grey','Don Yellow Dotted','Don Green',
+    'Double Press Grey','Double Press Green','Double Press Brown','Double Press Nude',
+    'Double Press Black','Double Press Yellow Dotted',
+    'Elektra Black','Elektra Beige','Elektra Spice','Elektra Grey','Elektra Cracked',
+    'Elektra Red','Elektra Dark Brown','Elektra Choco',
+    'Ella Sling Black','Ella Sling Melon','Ella Sling Silver','Ella Sling Mint Green',
+    'Ella Sling Lilac','Ella Sling Mustard','Ella Sling Dark Green','Ella Sling Navy Blue',
+    'Ella Sling Brown','Ella Sling Red P','Ella Sling Pink',
+    'Elyse Grey','Elyse D.Brown','Elyse Spice','Elyse Cracked','Elyse Black','Elyse Red',
+    'Elyse Beige','Elyse Chocolate','Elyse Red/Black','Elyse Spice/Black','Elyse Red/Beige',
+    'Elyse Black/Grey','Elyse Black/Cracked',
+    'Esmeralda Black','Esmeralda Brown','Esmeralda Nude','Esmeralda Green','Esmeralda Grey',
+    'Esmeralda Red','Esmeralda Blue',
+    'Fabela Black','Fabela Brown','Fabela Grey','Fabela Yellow Dotted','Fabela Green','Fabela Nude',
+    'Fanny Amapiano Black','Fanny Amapiano Brown','Fanny Amapiano Grey','Fanny Amapiano Cracked',
+    'Fanny Amapiano Nude',
+    'Fanny Pack Black','Fanny Pack Brown','Fanny Pack Grey','Fanny Pack Green',
+    'Fanny Pack Cracked','Fanny Pack Nude','Fanny Pack Dark Brown','Fanny Pack Black Tt',
+    'Fanny Pack Spice','Fanny Pack Yellow Dotted','Fanny Pack Grey Tt','Fanny Pack Black Mpw',
+    'Fanny Pack Beige Tt',
+    'Fayola Black','Fayola Grey','Fayola Nude','Fayola Green','Fayola Brown',
+    'Fayola Yellow Dotted','Fayola Titan 15',
+    'Feroz Grey','Feroz Red','Feroz Spice','Feroz Beige','Feroz Cracked','Feroz Black',
+    'Feroz Choco','Feroz Dark Brown','Feroz Yellow Brown',
+    'Foxy Melon','Foxy Mustard','Foxy Blue','Foxy Pink','Foxy Brown','Foxy Green','Foxy Black',
+    'Gift Bag A3','Gift Bag A4','Gift Bag A5',
+    'Gym Bag Brown','Gym Bag Green','Gym Bag Black','Gym Bag Grey','Gym Bag Nude',
+    'Gym Bag Yellow Dotted',
+    'Hood White','Hood N.Blue','Hood Green','Hood Maroon','Hood Grey','Hood Black','Hood Red',
+    'Icon Black','Icon Spice','Icon Grey','Icon Beige','Icon Cracked','Icon Red','Icon Choco',
+    'Imani Black 018','Imani Maroon 018','Imani Dark Brown 018','Imani Spice','Imani Grey',
+    'Imani Beige','Imani Red','Imani Beige 018','Imani Green Tt',
+    'Jabari Beige','Jabari Cracked','Jabari Maroon','Jabari Black','Jabari Dark Brown',
+    'Jade Spice','Jade Dark Brown','Jade Black','Jade Beige','Jade Cracked','Jade Grey',
+    'Jade Red','Jade Yellow Brown','Jade Chocolate',
+    'Jamela Spice','Jamela Grey','Jamela Cracked','Jamela Black','Jamela Red',
+    'Jamela Yellow Brown','Jamela Chocolate','Jamela Beige','Jamela Dark Brown',
+    'Jayden Man Black','Jayden Man Brown','Jayden Man Grey','Jayden Man Nude',
+    'Jayden Man Green','Jayden Man Yellow Dotted',
+    'Jumbo Black','Jumbo Brown','Jumbo Green','Jumbo Grey','Jumbo Nude','Jumbo Crimson',
+    'Jumbo Blue','Jumbo Yellow Dotted',
+    'Kai Black','Kai Grey','Kai Brown','Kai Beige','Kai Yellow Dotted','Kai Green',
+    'Kanji Spice','Kanji Black','Kanji Red','Kanji Navy','Kanji Choco','Kanji Beige',
+    'Kanji Cracked','Kanji Grey','Kanji Dark Brown',
+    'Kaos Grey','Kaos Spice','Kaos Cracked','Kaos Beige','Kaos Red','Kaos Black',
+    'Kaos Choco','Kaos Dark Brown','Kaos Yellow Brown',
+    'Karina Croc Black','Karina Red.Pattern','Karina Wooven Black','Karina Wooven Maroon',
+    'Karina Grey','Karina Spice','Karina Cracked','Karina Beige','Karina Red','Karina Black',
+    'Karina Choco','Karina Dark Brown','Karina Wooven Mustard','Karina Wooven Purple',
+    'Karina Croc Mustard','Karina Croc Brown','Karina Croc Pink','Karina Croc Orange',
+    'Kate Wooven Black','Kate Red.Pattern','Kate Maroon','Kate Wooven Mustard',
+    'Kate Wooven Purple','Kate Black/Red','Kate Maroon/Masturd','Kate Green/Red',
+    'Kate Brown/Red','Kate Black/Maroon','Kate Mustard/Red','Kate Yellow Brown',
+    'Kate Black','Kate Spice','Kate Grey','Kate Cracked','Kate Red','Kate Beige',
+    'Kate Dark Brown','Kate Chocolate',
+    'Kayla Dark Brown','Kayla Cracked','Kayla Spice','Kayla Grey','Kayla Black',
+    'Kayla Chocolate','Kayla Red',
+    'Kaz Black','Kaz Yellow Dotted','Kaz Brown','Kaz Nude','Kaz Grey','Kaz Green',
+    'Ladona Spice','Ladona Dark Brown','Ladona Black','Ladona Beige','Ladona Cracked',
+    'Ladona Grey','Ladona Red','Ladona Yellow Brown','Ladona Chocolate',
+    'Lafemme Black (Obsidian)','Lafemme Pink (Éclat)','Lafemme Red (Garnet)','Lafemme Wine Red (Mulberry)',
+    'Lamora Black','Lamora Sky Blue','Lamora Brown','Lamora Red',
+    'Lanka Wooven Black','Lanka Wooven Mustard','Lanka Wooven Purple','Lanka Wooven Maroon',
+    'Legacy Black','Legacy Brown','Legacy Grey','Legacy Dark Brown','Legacy Green',
+    'Legacy Cracked','Legacy Beige','Legacy Red','Legacy Antelope Brown',
+    'Leila Spice','Leila Red.Pattern','Leila Black','Leila Chocolate','Leila Red',
+    'Leila Beige','Leila Grey','Leila Cracked','Leila Dark Brown',
+    'Liam Black','Liam Brown','Liam Nude','Liam Green','Liam Grey','Liam Red',
+    'Lite Black/Brown','Lite Brown/Black','Lite Grey/Black','Lite Nude/Black','Lite Green/Black',
+    'Lola Yellow Brown','Lola Red.Pattern','Lola Wooven Black','Lola Wooven Maroon',
+    'Lola Wooven Mustard','Lola Wooven Purple','Lola Grey','Lola Choco','Lola Cracked',
+    'Lola Red','Lola Black','Lola Spice','Lola Beige','Lola Maroon','Lola Dark Brown',
+    'Loop Bp Cn Black','Loop Bp Spice','Loop Bp Cracked','Loop Bp Beige','Loop Bp Maroon',
+    'Loop Bp Green','Loop Bp Cn Grey','Loop Bp Red','Loop Bp Dark Brown','Loop Bp Cn Dark Brown',
+    'Lotus Grey','Lotus Cracked','Lotus Spice','Lotus Beige','Lotus Black','Lotus Red',
+    'Lotus Dark Brown','Lotus Choco',
+    'Luca Black','Luca Nude','Luca Brown','Luca Yellow Dotted','Luca Green','Luca Grey',
+    'Luna Black','Luna Green','Luna Yellow Dotted','Luna Brown','Luna Nude','Luna Grey',
+    'Luna Amapiano Black','Luna Amapiano Green','Luna Amapiano Yellow Dotted',
+    'Luna Amapiano Brown','Luna Amapiano Nude','Luna Amapiano Grey',
+    'Lunchset Black','Lunchset Nude','Lunchset Brown','Lunchset Yellow Dotted',
+    'Lunchset Green','Lunchset Grey',
+    'Make Up Pouch Brown','Make Up Pouch Black','Make Up Pouch Yellow Dotted',
+    'Make Up Pouch Grey','Make Up Pouch Nude','Make Up Pouch Blue','Make Up Pouch Green',
+    'Man Bag Black','Man Bag Brown','Man Bag Nude','Man Bag Grey','Man Bag Green',
+    'Man Bag Yellow Dotted','Man Bag Red','Man Bag Blue',
+    'Mandy Hb Black','Mandy Hb Spice','Mandy Hb Cracked','Mandy Hb Grey','Mandy Hb Choco',
+    'Mandy Hb Beige','Mandy Hb Yellow Brown','Mandy Hb Dark Brown','Mandy Hb Red',
+    'Marley Beige','Marley Black','Marley Maroon','Marley Dark Brown',
+    'Maya Mustard','Maya Red.Pattern','Maya Wooven Black','Maya Wooven Maroon',
+    'Maya Wooven Mustard','Maya Wooven Purple','Maya Black','Maya Pink','Maya Mint Green',
+    'Maya Brown','Maya Lilac','Maya Blue',
+    'Mega Black','Mega Brown','Mega Grey','Mega Nude','Mega Green','Mega Yellow Dotted',
+    'Mini Manbag Grey','Mini Manbag Black','Mini Manbag Cracked','Mini Manbag Beige',
+    'Mini Manbag Red','Mini Manbag Spice','Mini Manbag Chocolate','Mini Manbag Yellow Brown',
+    'Mini Manbag Dark Brown',
+    'Mini Maya Wooven Mustard','Mini Maya Red.Pattern','Mini Maya Wooven Black',
+    'Mini Maya Wooven Purple','Mini Maya Wooven Maroon',
+    'Mini School Black','Mini School Grey','Mini School Brown','Mini School Red',
+    'Mini School Green','Mini School Nude',
+    'Mini Umbra Black','Mini Umbra Grey','Mini Umbra Cracked','Mini Umbra Spice',
+    'Mini Umbra Manyatta Dark Brown','Mini Umbra Manyatta Dark Green','Mini Umbra Manyatta Green',
+    'Mini Umbra Manyatta Yellow','Mini Umbra Beige','Mini Umbra Dark brown','Mini Umbra Red',
+    'Mini Umbra Yellow Brown','Mini Umbra Chocolate',
+    'Mini Zuri Grey','Mini Zuri Wooven Black','Mini Zuri Wooven Maroon','Mini Zuri Wooven Mustard',
+    'Mini Zuri Wooven Purple','Mini Zuri Black','Mini Zuri Beige','Mini Zuri Red',
+    'Mini Zuri Spice','Mini Zuri Cracked','Mini Zuri Maroon','Mini Zuri Amber Brown',
+    'Mini Zuri Yellow Brown','Mini Zuri Chocolate','Mini Zuri Red P','Mini Zuri Dark Brown',
+    'Modern Travel Grey','Modern Travel Green','Modern Travel Brown','Modern Travel Nude',
+    'Modern Travel Black','Modern Travel Yellow Dotted',
+    'Monah Bp Black','Monah Bp Spice','Monah Bp Cracked','Monah Bp Grey','Monah Bp Beige',
+    'Monah Bp Maroon','Monah Bp Choco','Monah Bp Dark Brown','Monah Bp Red',
+    'Montana Beige','Montana Black','Montana Choco','Montana Cracked','Montana Cream',
+    'Montana Dark Brown','Montana Green Tt','Montana Grey','Montana Red','Montana Spice',
+    'Moon Bag Spice','Moon Bag Red.Pattern','Moon Bag Wooven Black','Moon Bag Wooven Maroon',
+    'Moon Bag Wooven Mustard','Moon Bag Wooven Purple','Moon Bag Grey','Moon Bag Cracked',
+    'Moon Bag Black','Moon Bag Beige','Moon Bag Red','Moon Bag Yellow Brown',
+    'Moon Bag Chocolate Brown','Moon Bag Maroon','Moon Bag Amber Brown','Moon Bag Dark Brown',
+    'Mradi Travel Black','Mradi Travel Brown','Mradi Travel Green','Mradi Travel Yellow Dotted',
+    'Mradi Travel Grey','Mradi Travel Nude',
+    'Mystique Grey','Mystique Black','Mystique Cracked','Mystique Beige','Mystique Red',
+    'Mystique Spice','Mystique Chocolate','Mystique Yellow Brown','Mystique Dark Brown',
+    'Nala Black','Nala Blue','Nala Red','Nala Green',
+    'Neo Man Black','Neo Man Grey','Neo Man Brown','Neo Man Green','Neo Man Nude',
+    'Neo Man Yellow Dotted',
+    'Nina Mustard','Nina Black','Nina Lilac','Nina Pink','Nina Blue','Nina Green',
+    'Nina Maroon','Nina Mint Green','Nina Brown',
+    'Nizana Black','Nizana Red.Pattern','Nizana Cracked','Nizana Spice','Nizana Grey',
+    'Nizana Beige','Nizana Choco','Nizana Yellow Brown','Nizana Red','Nizana Dark Brown',
+    'Nova Spice','Nova Grey','Nova Black','Nova Nude','Nova Cracked','Nova Chocolate',
+    'Nova Yellow Brown',
+    'Nyla Bp Black','Nyla Bp Brown','Nyla Bp Nude','Nyla Bp Grey','Nyla Bp Yellow Dotted',
+    'Nyla Bp Green',
+    'Oval Handbag Brown','Oval Handbag Wooven Black','Oval Handbag Wooven Maroon',
+    'Oval Handbag Wooven Mustard','Oval Handbag Wooven Purple','Oval Handbag Grey',
+    'Oval Handbag Green','Oval Handbag Nude','Oval Handbag Black','Oval Handbag Red',
+    'Oval Handbag Red P','Oval Handbag Chocolate',
+    'Pioneer Black','Pioneer Brown','Pioneer Grey','Pioneer Nude','Pioneer Green',
+    'Pioneer Yellow Dotted',
+    'Pocket Travel Black','Pocket Travel Brown','Pocket Travel Nude','Pocket Travel Yellow Dotted',
+    'Pocket Travel Green','Pocket Travel Grey',
+    'POH Hairistic Spice','POH Hairistic Grey','POH Hairistic Brown','POH Hairistic Cracked',
+    'POH Hairistic Red','POH Hairistic Choco','POH Hairistic Black',
+    'Prime Black','Prime Brown','Prime Nude','Prime Grey','Prime Yellow Dotted',
+    'Prime Green','Prime Red',
+    'Reesto Chest Grey','Reesto Chest Spice','Reesto Chest Cracked','Reesto Chest Beige',
+    'Reesto Chest Red','Reesto Chest Black','Reesto Chest Choco','Reesto Chest Dark Brown',
+    'Reesto Chest Yellow Brown',
+    'Remi Spice','Remi Dark Brown','Remi Black','Remi Beige','Remi Cracked','Remi Grey',
+    'Remi Red','Remi Yellow Brown','Remi Chocolate',
+    'Reo Travel Black','Reo Travel Brown','Reo Travel Nude','Reo Travel Grey',
+    'Reo Travel Yellow Dotted','Reo Travel Green',
+    'Roza Cracked','Roza Spice','Roza Grey','Roza Black','Roza Red','Roza Yellow Brown',
+    'Roza Chocolate','Roza Dark Brown','Roza Maroon','Roza Beige',
+    'Safiri Bp Black','Safiri Bp Brown','Safiri Bp Nude','Safiri Bp Grey','Safiri Bp Green',
+    'Safiri Travel Brown','Safiri Travel Black','Safiri Travel Grey','Safiri Travel Nude',
+    'Safiri Travel Yellow Dotted','Safiri Travel Crimson','Safiri Travel Green',
+    'Santana Mint Green','Santana Red.Pattern','Santana Black','Santana Mustard','Santana Lilac',
+    'Sarai Nude','Sarai Yellow Doted','Sarai Black','Sarai Green','Sarai Grey','Sarai Brown',
+    'Satchel Black','Satchel Grey','Satchel Spice','Satchel Cracked','Satchel Red',
+    'Satchel Beige','Satchel Wooven Black','Satchel Chocolate','Satchel Yellow Brown',
+    'Satis Black','Satis Cracked','Satis Spice','Satis Grey','Satis Red','Satis Beige',
+    'Satis Yellow Brown','Satis Amber','Satis D.Brown','Satis Chocolate',
+    'Savannah Sling Black','Savannah Sling Caramel','Savannah Sling Mustard',
+    'Savannah Sling Maroon','Savannah Sling Cream',
+    'Scarlet Black','Scarlet Croc.Pink','Scarlet Croc.Orange','Scarlet Croc.Mustard',
+    'Scarlet Croc.Brown',
+    'School Bag Black','School Bag Brown','School Bag Beige','School Bag Grey',
+    'School Bag Green','School Bag Blue',
+    'Scooby Black','Scooby Dark Brown','Scooby Spice','Scooby Grey','Scooby Red',
+    'Scooby Cracked','Scooby Choco','Scooby Beige',
+    'Shugli Backpack Brown','Shugli Backpack Black','Shugli Backpack Grey',
+    'Shugli Backpack Yellow Dotted','Shugli Backpack Green','Shugli Backpack Nude',
+    'Sierra Handbag Wooven Black','Sierra Handbag Wooven Cream','Sierra Handbag Wooven Maroon',
+    'Sierra Handbag Wooven Brown',
+    'Skye Hb Wooven Black','Skye HB Wooven Lilac','Skye Hb Wooven Maroon','Skye Hb Wooven Mustard',
+    'Sleeve 1 Caramel','Sleeve 1 Black','Sleeve 1 Brown','Sleeve 1 Green',
+    'Sleeve 2 Caramel','Sleeve 2 Black','Sleeve 2 Brown','Sleeve 2 Green',
+    'Spark Black','Spark Brown','Spark Grey','Spark Nude','Spark Green','Spark Yellow Dotted',
+    'Splash Backpack Black','SPlash Backpack Green','Splash Backpack Brown',
+    'Splash Backpack Beige','Splash Backpack Grey',
+    'Taji Black','Taji Maroon 018','Taji Dark Brown','Taji Beige','Taji Brown','Taji Green',
+    'Taji Red','Taji Blue','Taji Grey',
+    'Titan Travel Titan 1','Titan Travel Titan 15','Titan Travel Titan 5','Titan Travel Titan 14',
+    'Titan Travel Titan 11','Titan Travel Titan 3','Titan Travel Titan 6',
+    'Standard Travel Grey','Standard Travel Yellow Dotted','Standard Travel Nude',
+    'Standard Travel Brown','Standard Travel Black','Standard Travel Red',
+    'Standard Travel Blue','Standard Travel Green',
+    'Travolta Black','Travolta Dark Brown','Travolta Spice','Travolta Grey','Travolta Red',
+    'Travolta Cracked','Travolta Choco','Travolta Beige',
+    'Trecento Spice','Trecento Grey','Trecento Cracked','Trecento Black','Trecento Red',
+    'Trecento Wooven Maroon','Trecento Chocolate','Trecento Dark Brown','Trecento Red P',
+    'Trecento Beige',
+    'Trio Mio Black','Trio Mio Grey','Trio Mio Nude','Trio Mio Green','Trio Mio Brown',
+    'Twain Travel Grey','Twain Travel Beige','Twain Travel Red','Twain Travel Spice',
+    'Twain Travel Cracked','Twain Travel Yellow Brown','Twain Travel Chocolate',
+    'Twain Travel Dark Brown',
+    'Tyler Black','Tyler Yellow Dotted','Tyler Brown','Tyler Grey','Tyler Nude','Tyler Green',
+    'Umbra Cracked','Umbra Spice','Umbra Grey','Umbra Beige','Umbra Green','Umbra Red',
+    'Umbra Black','Umbra Dark Brown','Umbra Chocolate',
+    'Val Croc Orange','Val Croc Pink','Val Croc Brown','Val Black','Val Red','Val Croc Mustard',
+    'Vanity Spice','Vanity Dark Brown','Vanity Black','Vanity Beige','Vanity Cracked',
+    'Vanity Grey','Vanity Red','Vanity Yellow Brown','Vanity Amber','Vanity Maroon',
+    'Vanity Chocolate',
+    'Voyage Black','Voyage Brown','Voyage Green','Voyage Grey','Voyage Nude','Voyage Red',
+    'Voyage Blue','Voyage Yellow Dotted',
+    'Wander Luxe Pattern Pink','Wander Luxe Pattern Blue','Wander Luxe Pattern Red',
+    'Washbag Black','Washbag Brown','Washbag Nude','Washbag Grey','Washbag Yellow Dotted',
+    'Washbag Green',
+    'Yara Melon','Yara Mustard','Yara Blue','Yara Pink','Yara Brown','Yara Green','Yara Black',
+    'Zane Man Black','Zane Man Cracked','Zane Man Beige','Zane Man Spice','Zane Man Grey',
+    'Zane Man Chocolate','Zane Man Red','Zane Man Green','Zane Man Dark Brown',
+    'Zelus Black','Zelus Cracked','Zelus Beige','Zelus Spice','Zelus Grey','Zelus Chocolate',
+    'Zelus Dark Brown','Zelus Yellow Brown',
+    'Zeno Grey/Black','Zeno Spice/Black','Zeno Black/Grey','Zeno Cracked/Black',
+    'Zeno Yellow Brown','Zeno Chocolate/Black','Zeno Black/Red','Zeno Black/Cracked',
+    'Ziara Man Bag Brown','Ziara Man Bag Black','Ziara Man Bag Nude','Ziara Man Bag Green',
+    'Ziara Man Bag Yellow Dotted','Ziara Man Bag Grey',
+    'Zing Sling Black','Zing Sling Spice','Zing Sling Cracked','Zing Sling Grey',
+    'Zing Sling Yellow Brown','Zing Sling Chocolate','Zing Sling Red','Zing Sling Beige',
+    'Zing Sling Dark Brown',
+    'Zipped Lunchset Grey','Zipped Lunchset Brown','Zipped Lunchset Beige',
+    'Zipped Lunchset Black','Zipped Lunchset Yellow Dotted','Zipped Lunchset Green',
+    'Zoezi Brown','Zoezi Green','Zoezi Nude','Zoezi Black','Zoezi Grey','Zoezi Yellow Dotted',
+    'Zula Cn Black','Zula Cn Grey','Zula Antelope Brown','Zula Nude','Zula Green','Zula Red',
+    'Zula Black','Zula Yellow Dotted',
+    'Zuri Red','Zuri Red.Pattern','Zuri Beige','Zuri Black','Zuri Cracked','Zuri Spice',
+    'Zuri Chocolate','Zuri Yellow','Zuri Maroon','Zuri Amber','Zuri Grey','Zuri Dark Brown'
+  ]) WITH ORDINALITY AS t(name, ord)
+),
+
+master_order AS (
+  SELECT DISTINCT ON (UPPER(TRIM(name)))
+    UPPER(TRIM(name)) AS product_key,
+    ord               AS sort_order
+  from master_order_raw
+  ORDER BY UPPER(TRIM(name)), ord
+),
+
+shop_sales AS (
+  SELECT
+    CASE
+      WHEN lower(pc."name") IN ('website sales','website','jumia') OR p.session_id IS NULL THEN 'WEBSITE'
+      WHEN lower(pc."name") IN ('sinza','dar-es-alam')             THEN 'SINZA'
+      WHEN lower(pc."name") IN ('ktda','ktda shop')                THEN 'KTDA'
+      ELSE UPPER(pc."name")
+    END AS shop,
+    COALESCE(pt."name", '<<unknown>>') AS product_name,
+    SUM(pl.qty)                 AS units_sold,
+    SUM(pl.price_subtotal)      AS sales_amount,
+    SUM(pl.price_subtotal_incl) AS total_sales,
+    -- Converted per order, not per shop after the fact: p.currency_rate is
+    -- the rate Odoo itself recorded on that order (1 for Kenya, 25 for
+    -- Dar-Es-Alam, 34.482759 for Uganda), so this cannot drift from Odoo the
+    -- way a hardcoded divisor did.
+    SUM(pl.price_subtotal_incl / COALESCE(NULLIF(p.currency_rate, 0), 1)) AS total_sales_kes,
+    MAX(CASE WHEN COALESCE(pt.is_combo, FALSE) = TRUE
+             OR  COALESCE(pt."name", '') LIKE '%+%'
+             THEN 1 ELSE 0 END) AS combo_flag
+  FROM pos_order p
+  JOIN pos_order_line pl ON pl.order_id = p.id
+  LEFT JOIN pos_session ps ON p.session_id = ps.id
+  LEFT JOIN pos_config pc ON ps.config_id = pc.id
+  LEFT JOIN product_product pp ON pl.product_id = pp.id
+  LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  LEFT JOIN product_category pcat ON pcat.id = pt.categ_id
+  CROSS JOIN date_range dr
+  WHERE p.date_order::date BETWEEN dr.start_date AND dr.end_date
+    AND p.state IN ('done', 'paid', 'invoiced')  -- as the Sales page counts them
+    AND (
+          COALESCE(pt."name", '') NOT LIKE '%+%'
+          OR COALESCE(pt.is_combo, FALSE) = TRUE
+        )
+    -- Everything the customer was charged for except delivery, which is
+    -- what Odoo's dashboard totals: gift bags and order-level "KES discount"
+    -- lines belong in the takings. For 24 Sep 2026 leaving them out (plus the
+    -- Staff POS till below) read KES 1,367,425.64 against Odoo's 1,369,141.64.
+    AND COALESCE(pt."name", '') NOT ILIKE '%Delivery Fee%'
+    AND COALESCE(pcat."name", '') NOT ILIKE '%Pos%'
+    -- Refund lines carry a negative qty and a negative amount. Keeping
+    -- them nets returns off the day's takings, the way Odoo reports it;
+    -- excluding them reported gross sales and let a single mis-key stand
+    -- uncorrected (Eldoret keyed 777 Lola Black on 7 Sep 2026 and
+    -- reversed 776 an hour later, inflating that day by KES 1.4m).
+    AND pl.qty <> 0
+    AND (p.session_id IS NULL OR COALESCE(pc."name", '') <> '')       -- shop locations only, not blank/production
+    AND (p.session_id IS NULL OR pc."name" NOT ILIKE '%Flash Sale%')
+  GROUP BY 1, 2
+  HAVING SUM(pl.price_subtotal_incl) <> 0
+),
+
+tagged AS (
+  SELECT
+    ss.shop,
+    ss.product_name,
+    ss.units_sold,
+    ss.sales_amount,
+    ss.total_sales,
+    ss.total_sales_kes AS actual_sales,
+    CASE WHEN ss.combo_flag = 1 OR mo.product_key IS NOT NULL THEN 0 ELSE 1 END AS section,
+    ss.combo_flag AS combo_rank,
+    0 AS row_type
+  FROM shop_sales ss
+  LEFT JOIN master_order mo
+    ON mo.product_key = UPPER(TRIM(ss.product_name))
+),
+
+section_totals AS (
+  SELECT
+    '' AS shop,
+    CASE section
+      WHEN 0 THEN 'MASTERFILE TOTAL'
+      ELSE        'NON-MASTERFILE TOTAL'
+    END AS product_name,
+    SUM(units_sold)   AS units_sold,
+    SUM(sales_amount) AS sales_amount,
+    SUM(total_sales)  AS total_sales,
+    SUM(actual_sales) AS actual_sales,
+    section,
+    0 AS combo_rank,
+    1 AS row_type
+  FROM tagged
+  GROUP BY section
+)
+
+SELECT
+  shop         AS "SHOP",
+  product_name AS "PRODUCT",
+  units_sold   AS "UNITS SOLD",
+  ROUND(sales_amount, 2) AS "SALES AMOUNT",
+  ROUND(total_sales,  2) AS "TOTAL SALES",
+  ROUND(actual_sales, 2) AS "ACTUAL SALES"
+FROM (
+  SELECT * FROM tagged
+  UNION ALL
+  SELECT * FROM section_totals
+) combined
+ORDER BY
+  section,
+  row_type,
+  combo_rank,
+  total_sales DESC,
+  product_name,
+  shop;
+"""
+
+# Live on-hand stock by warehouse location x product. No date range — this is
+# a current-state snapshot of stock_quant, not a period-filtered movement.
+STOCK_LEVELS = """
+SELECT
+  sl.complete_name                    AS "Location",
+  COALESCE(pt."name", pp.id::text)    AS "Product",
+  SUM(sq.quantity)                    AS "Quantity"
+FROM stock_quant sq
+JOIN stock_location sl ON sq.location_id = sl.id
+JOIN product_product pp ON sq.product_id = pp.id
+LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+WHERE sl.usage = 'internal'
+  AND (
+       sl.complete_name ILIKE 'STAR/Stock%'  OR sl.complete_name ILIKE 'MSA/Stock%'
+    OR sl.complete_name ILIKE 'NAKS/Stock%'  OR sl.complete_name ILIKE 'ELD/Stock%'
+    OR sl.complete_name ILIKE 'KSM/Stock%'   OR sl.complete_name ILIKE 'MERU/Stock%'
+    OR sl.complete_name ILIKE 'THK/Stock%'   OR sl.complete_name ILIKE 'HAZ/Stock%'
+    OR sl.complete_name ILIKE 'KITE/Stock%'  OR sl.complete_name ILIKE 'NAN/Stock%'
+    OR sl.complete_name ILIKE 'KAK/Stock%'   OR sl.complete_name ILIKE 'HTN/Stock%'
+    OR sl.complete_name ILIKE 'DAR/Stock%'   OR sl.complete_name ILIKE 'UG/Stock%'
+    OR sl.complete_name ILIKE 'KSI/Stock%'   OR sl.complete_name ILIKE 'KTDA/Stock%'
+    OR sl.complete_name ILIKE 'BUSIA/Stock%' OR sl.complete_name ILIKE 'RONG/Stock%'
+    OR sl.complete_name ILIKE 'CBD/Stock%'
+    OR sl.complete_name ILIKE 'WEB/Stock%' OR sl.complete_name ILIKE '%WEBSITE%'
+  )
+  AND COALESCE(pt."name", '') NOT ILIKE '%+%'          -- exclude combo/bundle products
+  AND COALESCE(pt."name", '') NOT ILIKE '% or %'       -- exclude "X or Y" pick-one bundles
+  AND COALESCE(pt."name", '') NOT ILIKE '%Buy%Get%'    -- exclude "Buy X Get Y Free" bundles
+  -- Not stock to report: cleaning supplies, vouchers, samples and hoods.
+  AND COALESCE(pt."name", '') NOT ILIKE '%Antibacterial Wipe%'
+  AND COALESCE(pt."name", '') NOT ILIKE '%Foam%'
+  AND COALESCE(pt."name", '') NOT ILIKE '%Gift Voucher%'
+  AND COALESCE(pt."name", '') NOT ILIKE '%Sample%'      -- every sample: "Sample Heavy Black (Easy)", …
+  AND COALESCE(pt."name", '') NOT ILIKE 'Hood%'         -- Hood in every colour
+GROUP BY sl.complete_name, COALESCE(pt."name", pp.id::text)
+ORDER BY "Location", "Product";
+"""
+
+# What each shop RECEIVED — received basis: a bag lands in a shop column only
+# once its move into that shop's own stock is state='done'. STARMALL, HAZINA,
+# KTDA and HILTON are the exception (see v2_arrivals/ktda_receipts/v2_cbd_*/
+# v2_hilton_* below): they run on the hub-redistribution basis instead, where
+# arrival is counted as the bag LEAVES FINWH, because CBD/Hilton redistribute
+# from their own stock rather than through a per-shop transit node Odoo can
+# report a receipt against.
+COMBINED_DISTRIBUTION = """
+WITH params AS (
+  SELECT
+    CAST(:start_date AS DATE) AS start_date,
+    CAST(:end_date AS DATE) AS end_date
+),
+
+-- One pass over stock_move for the whole report — see DISPATCH_COMBINED's
+-- STREAM comments for why this is MATERIALIZED once rather than scanned
+-- per consumer. SUNDAY IS NOT FILTERED HERE: the warehouse does not dispatch
+-- on a Sunday, so ordinary shop receipt legs apply that filter themselves,
+-- but CBD/Hilton hub forwards do move stock on a Sunday and must not drop it.
+moves AS MATERIALIZED (
+  SELECT
+    m.id,
+    m.state,
+    m.product_qty            AS qty,
+    DATE(m."date")           AS move_date,
+    EXTRACT(DOW FROM m."date") = 0 AS is_sunday,
+    src.id                   AS src_id,
+    dest.id                  AS dest_id,
+    src.complete_name        AS src_path,
+    dest.complete_name       AS dest_path,
+    src."name"               AS src_short,
+    dest."name"              AS dest_short,
+    COALESCE(pt."name", pp.id::text) AS bag_name
+  FROM stock_move m
+  JOIN stock_location src  ON m.location_id = src.id
+  JOIN stock_location dest ON m.location_dest_id = dest.id
+  JOIN product_product pp  ON m.product_id = pp.id
+  LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  CROSS JOIN params p
+  WHERE DATE(m."date") BETWEEN p.start_date AND p.end_date
+    AND COALESCE(pt."name",'') NOT LIKE '%+%'
+),
+
+code_mapping AS (
+  SELECT 'STAR' AS code, 'STARMALL' AS full_name
+  UNION ALL SELECT 'STARMALL', 'STARMALL'
+  UNION ALL SELECT 'MSA', 'MOMBASA'
+  UNION ALL SELECT 'MOMBASA', 'MOMBASA'
+  UNION ALL SELECT 'NAKS', 'NAKURU'
+  UNION ALL SELECT 'NAKURU', 'NAKURU'
+  UNION ALL SELECT 'ELD', 'ELDORET'
+  UNION ALL SELECT 'ELDORET', 'ELDORET'
+  UNION ALL SELECT 'KSM', 'KISUMU'
+  UNION ALL SELECT 'KISUMU', 'KISUMU'
+  UNION ALL SELECT 'MERU', 'MERU'
+  UNION ALL SELECT 'THK', 'THIKA'
+  UNION ALL SELECT 'THIKA', 'THIKA'
+  UNION ALL SELECT 'HAZ', 'HAZINA'
+  UNION ALL SELECT 'HAZINA', 'HAZINA'
+  UNION ALL SELECT 'KITE', 'KITENGELA'
+  UNION ALL SELECT 'KITENGELA', 'KITENGELA'
+  UNION ALL SELECT 'RONG', 'RONGAI'
+  UNION ALL SELECT 'RONGAI', 'RONGAI'
+  UNION ALL SELECT 'NAN', 'NANYUKI'
+  UNION ALL SELECT 'NANYUKI', 'NANYUKI'
+  UNION ALL SELECT 'NYERI', 'NYERI'
+  UNION ALL SELECT 'KAK', 'KAKAMEGA'
+  UNION ALL SELECT 'KAKAMEGA', 'KAKAMEGA'
+  UNION ALL SELECT 'HTN', 'HILTON'
+  UNION ALL SELECT 'HILTON', 'HILTON'
+  UNION ALL SELECT 'DAR', 'SINZA'
+  UNION ALL SELECT 'SINZA', 'SINZA'
+  UNION ALL SELECT 'UG', 'UGANDA'
+  UNION ALL SELECT 'UGANDA', 'UGANDA'
+  UNION ALL SELECT 'KSI', 'KISII'
+  UNION ALL SELECT 'KISII', 'KISII'
+  UNION ALL SELECT 'BUSIA', 'BUSIA'
+  UNION ALL SELECT 'WEBSITE', 'WEBSITE'
+  UNION ALL SELECT 'WEB', 'WEBSITE'
+  UNION ALL SELECT 'JUMIA', 'JUMIA'
+  UNION ALL SELECT 'JMA', 'JUMIA'
+  UNION ALL SELECT 'MRKT', 'MRKT'
+  UNION ALL SELECT 'MKT', 'MRKT'
+  UNION ALL SELECT 'MARKET', 'MRKT'
+),
+
+-- RECEIPTS (leg 2): stock RECEIVED out of a Goods-in-Transit node into the
+-- final /Stock location, state='done'. This is the "received basis": a bag
+-- populates a shop column only when this leg-2 receipt is done. SINZA/UGANDA
+-- excluded here (own pool, see su_receipts), as are the four v2-basis shops.
+receipts_raw AS (
+  SELECT
+    m.bag_name AS bag_name,
+    CASE
+      WHEN m.dest_path ILIKE '%MSA/Stock%'    THEN 'MOMBASA'
+      WHEN m.dest_path ILIKE '%NAKS/Stock%'   THEN 'NAKURU'
+      WHEN m.dest_path ILIKE '%ELD/Stock%'    THEN 'ELDORET'
+      WHEN m.dest_path ILIKE '%KSM/Stock%'    THEN 'KISUMU'
+      WHEN m.dest_path ILIKE '%MERU/Stock%'   THEN 'MERU'
+      WHEN m.dest_path ILIKE '%THK/Stock%'    THEN 'THIKA'
+      WHEN m.dest_path ILIKE '%HAZ/Stock%'    THEN 'HAZINA'
+      WHEN m.dest_path ILIKE '%KITE/Stock%'   THEN 'KITENGELA'
+      WHEN m.dest_path ILIKE '%NAN/Stock%'    THEN 'NANYUKI'
+      WHEN m.dest_path ILIKE '%NYERI/Stock%'    THEN 'NYERI'
+      WHEN m.dest_path ILIKE '%KAK/Stock%'    THEN 'KAKAMEGA'
+      WHEN m.dest_path ILIKE '%KSI/Stock%'    THEN 'KISII'
+      WHEN m.dest_path ILIKE '%BUSIA/Stock%'  THEN 'BUSIA'
+      WHEN m.dest_path ILIKE '%RONG/Stock%'   THEN 'RONGAI'
+      WHEN m.dest_path ILIKE '%STAR/Stock%'   THEN 'STARMALL'
+      WHEN m.dest_path ILIKE '%CORP/Stock%'   THEN 'CORPORATE'
+      WHEN m.dest_path ILIKE '%MRKT%' OR m.dest_path ILIKE '%MARKET%' THEN 'MRKT'
+      WHEN m.dest_path ILIKE '%JUMIA%'        THEN 'JUMIA'
+      WHEN m.dest_path ILIKE '%WEB/Stock%' OR m.dest_path ILIKE '%WEBSITE%' THEN 'WEBSITE'
+      ELSE NULL
+    END AS dest_name,
+    m.qty,
+    m.move_date
+  FROM moves m
+  WHERE m.src_path ILIKE 'FINWH/Goods in Transit/%'
+    AND m.state = 'done'
+    AND NOT m.is_sunday
+    AND m.dest_path NOT ILIKE '%DAR%'
+    AND m.dest_path NOT ILIKE '%SINZA%'
+    AND m.dest_path NOT ILIKE '%UG/Stock%'
+    AND m.dest_path NOT ILIKE '%UGANDA%'
+    AND m.dest_path NOT ILIKE '%CBD/Stock%'
+    AND m.dest_path NOT ILIKE '%KTDA/Stock%'
+    AND m.dest_path NOT ILIKE '%HTN/Stock%'
+),
+arrivals_dedup AS (
+  SELECT DISTINCT bag_name, dest_name, qty, move_date, 'Direct' AS src, NULL::int AS dedup_key
+  FROM receipts_raw
+  WHERE dest_name IS NOT NULL
+),
+
+-- STARMALL and HAZINA on the v2 (hub-redistribution) basis: arrival is
+-- counted as the bag LEAVES FINWH's own stock, matching the "How each column
+-- is counted" note on the page and the same dispatch-basis pattern
+-- DISPATCH_COMBINED's finwh_filtered stream already uses for these two shops.
+-- KTDA and HILTON have their own dedicated v2 handling below (ktda_receipts /
+-- v2_cbd_* / v2_hilton_*) since they also receive CBD/Hilton forwards, which
+-- STARMALL/HAZINA do not.
+v2_arrivals AS (
+  SELECT
+    m.bag_name AS bag_name,
+    CASE
+      WHEN m.dest_path ILIKE '%STAR%' THEN 'STARMALL'
+      WHEN m.dest_path ILIKE '%HAZ%'  THEN 'HAZINA'
+      ELSE NULL
+    END AS dest_name,
+    m.qty AS qty,
+    m.move_date AS move_date,
+    'Direct' AS src,
+    m.id AS dedup_key
+  FROM moves m
+  WHERE m.src_path ILIKE 'FINWH%'
+    AND m.src_path NOT ILIKE '%Goods in Transit%'
+    AND m.dest_path NOT ILIKE '%Goods in Transit%'
+    AND (m.dest_path ILIKE '%STAR%' OR m.dest_path ILIKE '%HAZ%')
+    AND m.state != 'cancel'
+    AND NOT m.is_sunday
+),
+
+-- KTDA — the receipt leg only: FINWH/Goods in Transit/... -> CBD/Stock, done.
+ktda_receipts AS (
+  SELECT
+    m.bag_name AS bag_name,
+    'KTDA' AS dest_name,
+    m.qty AS qty,
+    m.move_date AS move_date,
+    'Direct' AS src,
+    m.id AS dedup_key
+  FROM moves m
+  WHERE m.src_path  ILIKE 'FINWH/Goods in Transit%'
+    AND m.dest_path ILIKE '%CBD/Stock%'
+    AND m.state = 'done'
+),
+
+-- CBD forwards, done-only. Added to the receiving shop, deducted from KTDA.
+cbd_out_to_shops_raw AS (
+  SELECT
+    m.bag_name AS bag_name,
+    CASE
+      WHEN m.dest_path ILIKE '%MSA/Stock%'    THEN 'MOMBASA'
+      WHEN m.dest_path ILIKE '%NAKS/Stock%'   THEN 'NAKURU'
+      WHEN m.dest_path ILIKE '%ELD/Stock%'    THEN 'ELDORET'
+      WHEN m.dest_path ILIKE '%KSM/Stock%'    THEN 'KISUMU'
+      WHEN m.dest_path ILIKE '%MERU/Stock%'   THEN 'MERU'
+      WHEN m.dest_path ILIKE '%THK/Stock%'    THEN 'THIKA'
+      WHEN m.dest_path ILIKE '%HAZ/Stock%'    THEN 'HAZINA'
+      WHEN m.dest_path ILIKE '%KITE/Stock%'   THEN 'KITENGELA'
+      WHEN m.dest_path ILIKE '%NAN/Stock%'    THEN 'NANYUKI'
+      WHEN m.dest_path ILIKE '%NYERI/Stock%'    THEN 'NYERI'
+      WHEN m.dest_path ILIKE '%KAK/Stock%'    THEN 'KAKAMEGA'
+      WHEN m.dest_path ILIKE '%KSI/Stock%'    THEN 'KISII'
+      WHEN m.dest_path ILIKE '%BUSIA/Stock%'  THEN 'BUSIA'
+      WHEN m.dest_path ILIKE '%RONG/Stock%' OR m.dest_path ILIKE '%RONG%' THEN 'RONGAI'
+      WHEN m.dest_path ILIKE '%STAR/Stock%'   THEN 'STARMALL'
+      WHEN m.dest_path ILIKE '%HTN/Stock%'    THEN 'HILTON'
+      WHEN m.dest_path ILIKE '%CORP/Stock%'   THEN 'CORPORATE'
+      WHEN m.dest_path ILIKE '%MRKT%' OR m.dest_path ILIKE '%MARKET%' THEN 'MRKT'
+      WHEN m.dest_path ILIKE '%JUMIA%'        THEN 'JUMIA'
+      WHEN m.dest_path ILIKE '%WEB/Stock%' OR m.dest_path ILIKE '%WEBSITE%' THEN 'WEBSITE'
+      ELSE NULL
+    END AS dest_name,
+    m.qty AS qty,
+    m.state AS move_state,
+    m.move_date AS move_date,
+    'CBD' AS src,
+    m.id AS dedup_key
+  FROM moves m
+  WHERE m.src_path ILIKE '%CBD/Stock%'
+    AND m.dest_path NOT ILIKE '%CBD/Stock%'
+    AND m.dest_path NOT ILIKE '%KTDA/Stock%'
+    AND m.dest_path NOT ILIKE '%SINZA%'
+    AND m.dest_path NOT ILIKE '%DAR%'
+    AND m.dest_path NOT ILIKE '%UGANDA%'
+    AND m.dest_path NOT ILIKE '%UG/Stock%'
+    AND m.state != 'cancel'
+),
+cbd_out_to_shops AS (
+  SELECT bag_name, dest_name, qty, move_date, src, dedup_key
+  FROM cbd_out_to_shops_raw
+  WHERE dest_name IS NOT NULL
+),
+
+-- SINZA / UGANDA — counted on the RECEIVED basis, exactly like MERU:
+--   the bag lands in the column when it arrives in the shop's own stock
+--   (DAR/Stock or UG/Stock) with the move done.
+--
+-- Both are fed mostly DIRECTLY from FINWH/Stock rather than through a
+-- Goods-in-Transit node — UG/Stock in particular receives nothing from
+-- FINWH/Goods in Transit/UGANDA — so this cannot reuse receipts_raw, which
+-- only looks at transit-node sources. Filtering on the DESTINATION instead
+-- means the two-leg case can't double count: only the move that actually
+-- lands in DAR/Stock or UG/Stock is counted, never the leg into transit.
+--
+-- Customer returns are excluded: that is not stock being distributed to the
+-- shop. Inventory adjustments are excluded too, with ONE exception — Uganda,
+-- which has no transit receipt leg at all and books arrivals that way. See the
+-- WHERE clause below.
+-- ============================================================
+su_receipts AS (
+  SELECT
+    m.bag_name AS bag_name,
+    CASE
+      WHEN m.dest_path ILIKE 'DAR/Stock%' THEN 'SINZA'
+      WHEN m.dest_path ILIKE 'UG/Stock%'  THEN 'UGANDA'
+      WHEN m.src_path  ILIKE 'UG/Stock%'  THEN 'UGANDA'   -- adjustment reversal
+    END AS dest_name,
+    -- Adjustments are netted, not just credited. Uganda writes stock on AND off
+    -- constantly (1,745 in, 1,607 out over 90 days), so counting only the
+    -- inbound side credited them with ~1,200 bags they never received and drove
+    -- their in-transit balance to -733.
+    CASE WHEN m.src_path ILIKE 'UG/Stock%' THEN -m.qty ELSE m.qty END AS qty,
+    m.move_date AS move_date,
+    'Direct' AS src,
+    -- Move id for the same reason as ktda_receipts: these are single-source
+    -- rows, so two identical receipts on one day are two deliveries, not a
+    -- duplicate to be collapsed.
+    m.id AS dedup_key
+  FROM moves m
+  WHERE m.state = 'done'
+    AND (
+      -- The normal case, and the only one that applies to Sinza. Sundays are
+      -- excluded HERE ONLY: warehouse deliveries follow the warehouse week.
+      ( (m.dest_path ILIKE 'DAR/Stock%' OR m.dest_path ILIKE 'UG/Stock%')
+        AND (m.src_path ILIKE '%FINWH%' OR m.src_path ILIKE '%CBD/Stock%')
+        AND NOT m.is_sunday )
+      OR
+      -- UGANDA ONLY. The direct FINWH -> UG/Stock route stopped on 17 Jun 2026;
+      -- since then everything routes through FINWH/Goods in Transit/UGANDA and
+      -- NOTHING has ever moved out of that node into UG/Stock — Uganda books
+      -- the arrival as an inventory adjustment at their end. Without this the
+      -- column reads zero received while dispatch keeps counting sends, so the
+      -- in-transit balance only ever grows.
+      --
+      -- Deliberately NOT extended to the other shops: they all have a real
+      -- transit receipt leg AND routine stock-count adjustments (Starmall took
+      -- 2,041 from its node and 2,060 by adjustment over 120 days), so counting
+      -- adjustments there would roughly double what they appear to receive.
+      ( m.dest_path ILIKE 'UG/Stock%'
+        AND m.src_path ILIKE '%Inventory adjustment%' )
+      OR
+      -- Both adjustment legs ignore the Sunday rule, and must: Uganda runs its
+      -- stock count on a Sunday, so 1,529 of the 1,607 write-offs land on one.
+      -- Dropping those while keeping the weekday write-ons credited Uganda with
+      -- ~1,200 phantom bags.
+      ( m.src_path  ILIKE 'UG/Stock%'
+        AND m.dest_path ILIKE '%Inventory adjustment%' )
+    )
+),
+v2_cbd_forward AS (
+  -- Feeds the shop COLUMNS. WEBSITE stays out: website arrivals fold into
+  -- KTDA elsewhere, so adding them here would report the same bags twice.
+  SELECT bag_name, dest_name, qty, move_date, src, dedup_key
+  FROM cbd_out_to_shops_raw
+  WHERE dest_name IS NOT NULL
+    AND dest_name <> 'WEBSITE'
+    AND move_state = 'done'
+),
+-- Everything CBD handed on, website included. Separate from v2_cbd_forward
+-- because this one only feeds the DENRI SHOPS roll-up, which is a reference
+-- figure in no total — so counting website here cannot double-report it, and
+-- leaving it out understated the column by every website order.
+cbd_gave_out AS (
+  SELECT bag_name, dest_name, qty, move_date, src, dedup_key
+  FROM cbd_out_to_shops_raw
+  WHERE dest_name IS NOT NULL
+    AND move_state = 'done'
+),
+v2_cbd_add AS (
+  -- CBD forwards land in whichever shop received them, not just the four on
+  -- the v2 basis — this is the single path by which any CBD onward send
+  -- reaches a shop column.
+  SELECT bag_name, dest_name, qty, move_date, src, dedup_key
+  FROM v2_cbd_forward
+),
+v2_cbd_deduct AS (
+  SELECT bag_name, 'KTDA' AS dest_name, -qty AS qty, move_date, src, dedup_key
+  FROM v2_cbd_forward
+),
+
+-- Hilton forwards out of HTN/Stock. Everything except the SINZA/UGANDA export
+-- is deducted from HILTON; only the in-scope columns receive the matching add,
+-- because the rest still run on the received basis.
+v2_hilton_forward AS (
+  SELECT
+    m.bag_name AS bag_name,
+    -- Full shop mapping, not just the in-scope four: an unmapped destination
+    -- (customer sales, inventory adjustments, warehouse returns) is NOT a
+    -- forward and must not be deducted from HILTON.
+    CASE
+      WHEN m.dest_path ILIKE '%MSA/Stock%'    THEN 'MOMBASA'
+      WHEN m.dest_path ILIKE '%NAKS/Stock%'   THEN 'NAKURU'
+      WHEN m.dest_path ILIKE '%ELD/Stock%'    THEN 'ELDORET'
+      WHEN m.dest_path ILIKE '%KSM/Stock%'    THEN 'KISUMU'
+      WHEN m.dest_path ILIKE '%MERU/Stock%'   THEN 'MERU'
+      WHEN m.dest_path ILIKE '%THK/Stock%'    THEN 'THIKA'
+      WHEN m.dest_path ILIKE '%HAZ/Stock%'    THEN 'HAZINA'
+      WHEN m.dest_path ILIKE '%KITE/Stock%'   THEN 'KITENGELA'
+      WHEN m.dest_path ILIKE '%NAN/Stock%'    THEN 'NANYUKI'
+      WHEN m.dest_path ILIKE '%NYERI/Stock%'    THEN 'NYERI'
+      WHEN m.dest_path ILIKE '%KAK/Stock%'    THEN 'KAKAMEGA'
+      WHEN m.dest_path ILIKE '%KSI/Stock%'    THEN 'KISII'
+      WHEN m.dest_path ILIKE '%BUSIA/Stock%'  THEN 'BUSIA'
+      WHEN m.dest_path ILIKE '%RONG%'         THEN 'RONGAI'
+      WHEN m.dest_path ILIKE '%STAR/Stock%'   THEN 'STARMALL'
+      WHEN m.dest_path ILIKE '%CORP/Stock%'   THEN 'CORPORATE'
+      WHEN m.dest_path ILIKE '%MRKT%' OR m.dest_path ILIKE '%MARKET%' THEN 'MRKT'
+      WHEN m.dest_path ILIKE '%JUMIA%'        THEN 'JUMIA'
+      WHEN m.dest_path ILIKE '%CBD/Stock%'
+        OR m.dest_path ILIKE '%KTDA%'
+        OR m.dest_path ILIKE '%WEB/Stock%'
+        OR m.dest_path ILIKE '%WEBSITE%'      THEN 'KTDA'
+      ELSE NULL
+    END AS dest_name,
+    m.qty AS qty,
+    m.move_date AS move_date,
+    'HTN' AS src,
+    m.id AS dedup_key
+  FROM moves m
+  WHERE m.src_path ILIKE '%HTN/Stock%'
+    AND m.dest_path NOT ILIKE '%HTN/Stock%'
+    AND m.dest_path NOT ILIKE '%SINZA%'
+    AND m.dest_path NOT ILIKE '%DAR%'
+    AND m.dest_path NOT ILIKE '%UGANDA%'
+    AND m.dest_path NOT ILIKE '%UG/Stock%'
+    AND m.state != 'cancel'
+),
+v2_hilton_add AS (
+  SELECT bag_name, dest_name, qty, move_date, src, dedup_key
+  FROM v2_hilton_forward
+  WHERE dest_name IS NOT NULL
+    AND dest_name <> 'KTDA'
+),
+v2_hilton_deduct AS (
+  SELECT bag_name, 'HILTON' AS dest_name, -qty AS qty, move_date, src, dedup_key
+  FROM v2_hilton_forward
+  WHERE dest_name IS NOT NULL
+),
+
+-- KTDA NEW = (CBD/Stock -> KTDA/Stock)  minus  (KTDA/Stock -> CBD/Stock returns only)
+ktda_new AS (
+  SELECT
+    m.bag_name AS bag_name,
+    'KTDA NEW' AS dest_name,
+    SUM(CASE
+          WHEN m.dest_path ILIKE '%KTDA/Stock%'
+           AND m.src_path  ILIKE '%CBD/Stock%'  THEN  m.qty
+          WHEN m.src_path  ILIKE '%KTDA/Stock%'
+           AND m.dest_path ILIKE '%CBD/Stock%'  THEN -m.qty
+          ELSE 0 END) AS qty
+  FROM moves m
+  WHERE ( (m.dest_path ILIKE '%KTDA/Stock%' AND m.src_path ILIKE '%CBD/Stock%')
+          OR (m.src_path ILIKE '%KTDA/Stock%' AND m.dest_path ILIKE '%CBD/Stock%') )
+    AND m.src_id != m.dest_id
+    AND m.state != 'cancel'
+  GROUP BY m.bag_name
+),
+
+-- DENRI SHOPS = everything CBD forwarded on, website included.
+denri_shops AS (
+  SELECT bag_name, SUM(qty) AS denri_qty
+  FROM cbd_gave_out
+  GROUP BY bag_name
+),
+
+all_moves AS (
+  SELECT bag_name, dest_name, qty, move_date, src, dedup_key
+  FROM (
+    SELECT bag_name,
+           CASE WHEN dest_name = 'WEBSITE' THEN 'KTDA' ELSE dest_name END AS dest_name,
+           qty, move_date, src, dedup_key
+    FROM arrivals_dedup
+  ) v1_legs
+  WHERE dest_name NOT IN ('STARMALL','HAZINA','KTDA','HILTON')
+  UNION ALL
+  SELECT bag_name, dest_name, qty, move_date, src, dedup_key FROM su_receipts
+  UNION ALL
+  SELECT bag_name, dest_name, qty, move_date, src, dedup_key FROM v2_arrivals
+  UNION ALL
+  SELECT bag_name, dest_name, qty, move_date, src, dedup_key FROM ktda_receipts
+  UNION ALL
+  SELECT bag_name, dest_name, qty, move_date, src, dedup_key FROM v2_cbd_add
+  UNION ALL
+  SELECT bag_name, dest_name, qty, move_date, src, dedup_key FROM v2_hilton_add
+  UNION ALL
+  SELECT bag_name, dest_name, qty, move_date, src, dedup_key FROM v2_hilton_deduct
+),
+distinct_moves AS (
+  SELECT DISTINCT bag_name, dest_name, qty, move_date, src, dedup_key
+  FROM all_moves
+),
+shop_agg AS (
+  SELECT bag_name, dest_name, SUM(qty) AS qty
+  FROM distinct_moves
+  GROUP BY bag_name, dest_name
+),
+aggregated_moves AS (
+  SELECT bag_name, dest_name, qty FROM shop_agg
+  UNION ALL
+  SELECT bag_name, dest_name, qty FROM ktda_new WHERE qty <> 0
+),
+
+jumia_src AS (
+  SELECT bag_name,
+         STRING_AGG(src || ': ' || s_qty, ', ' ORDER BY src) AS src_txt
+  FROM (
+    SELECT bag_name, src, SUM(qty) AS s_qty
+    FROM distinct_moves
+    WHERE dest_name = 'JUMIA'
+    GROUP BY bag_name, src
+    HAVING SUM(qty) <> 0
+  ) z
+  GROUP BY bag_name
+),
+mrkt_src AS (
+  SELECT bag_name,
+         STRING_AGG(src || ': ' || s_qty, ', ' ORDER BY src) AS src_txt
+  FROM (
+    SELECT bag_name, src, SUM(qty) AS s_qty
+    FROM distinct_moves
+    WHERE dest_name = 'MRKT'
+    GROUP BY bag_name, src
+    HAVING SUM(qty) <> 0
+  ) z
+  GROUP BY bag_name
+),
+
+bag_universe AS (
+  SELECT bag_name FROM aggregated_moves
+  UNION
+  SELECT bag_name FROM denri_shops
+),
+pivoted_detail AS (
+  SELECT
+    b.bag_name,
+    SUM(CASE WHEN dest_name = 'STARMALL' THEN qty ELSE 0 END)   AS "STARMALL",
+    SUM(CASE WHEN dest_name = 'MOMBASA' THEN qty ELSE 0 END)    AS "MOMBASA",
+    SUM(CASE WHEN dest_name = 'NAKURU' THEN qty ELSE 0 END)     AS "NAKURU",
+    SUM(CASE WHEN dest_name = 'ELDORET' THEN qty ELSE 0 END)    AS "ELDORET",
+    SUM(CASE WHEN dest_name = 'KISUMU' THEN qty ELSE 0 END)     AS "KISUMU",
+    SUM(CASE WHEN dest_name = 'MERU' THEN qty ELSE 0 END)       AS "MERU",
+    SUM(CASE WHEN dest_name = 'THIKA' THEN qty ELSE 0 END)      AS "THIKA",
+    SUM(CASE WHEN dest_name = 'HAZINA' THEN qty ELSE 0 END)     AS "HAZINA",
+    SUM(CASE WHEN dest_name = 'KITENGELA' THEN qty ELSE 0 END)  AS "KITENGELA",
+    SUM(CASE WHEN dest_name = 'WEBSITE' THEN qty ELSE 0 END)    AS "WEBSITE",
+    SUM(CASE WHEN dest_name = 'NANYUKI' THEN qty ELSE 0 END)    AS "NANYUKI",
+    SUM(CASE WHEN dest_name = 'NYERI' THEN qty ELSE 0 END)    AS "NYERI",
+    SUM(CASE WHEN dest_name = 'KAKAMEGA' THEN qty ELSE 0 END)   AS "KAKAMEGA",
+    SUM(CASE WHEN dest_name = 'HILTON' THEN qty ELSE 0 END)     AS "HILTON",
+    SUM(CASE WHEN dest_name = 'JUMIA' THEN qty ELSE 0 END)      AS "JUMIA",
+    SUM(CASE WHEN dest_name = 'MRKT' THEN qty ELSE 0 END)       AS "MRKT",
+    SUM(CASE WHEN dest_name = 'SINZA' THEN qty ELSE 0 END)      AS "SINZA",
+    SUM(CASE WHEN dest_name = 'UGANDA' THEN qty ELSE 0 END)     AS "UGANDA",
+    SUM(CASE WHEN dest_name = 'KISII' THEN qty ELSE 0 END)      AS "KISII",
+    SUM(CASE WHEN dest_name = 'KTDA' THEN qty ELSE 0 END)       AS "KTDA",
+    SUM(CASE WHEN dest_name = 'KTDA NEW' THEN qty ELSE 0 END)   AS "KTDA NEW",
+    SUM(CASE WHEN dest_name = 'BUSIA' THEN qty ELSE 0 END)      AS "BUSIA",
+    SUM(CASE WHEN dest_name = 'RONGAI' THEN qty ELSE 0 END)     AS "RONGAI",
+    SUM(CASE WHEN dest_name = 'CORPORATE' THEN qty ELSE 0 END)  AS "CORPORATE",
+    COALESCE(ds.denri_qty,0)                                    AS "DENRI SHOPS"
+  FROM bag_universe b
+  LEFT JOIN aggregated_moves a ON a.bag_name = b.bag_name
+  LEFT JOIN denri_shops ds     ON ds.bag_name = b.bag_name
+  GROUP BY b.bag_name, ds.denri_qty
+),
+
+pivoted_valued AS (
+  SELECT *
+  FROM pivoted_detail
+  WHERE ("STARMALL" <> 0 OR "MOMBASA" <> 0 OR "NAKURU" <> 0 OR "ELDORET" <> 0
+      OR "KISUMU" <> 0 OR "MERU" <> 0 OR "THIKA" <> 0 OR "HAZINA" <> 0
+      OR "KITENGELA" <> 0 OR "NANYUKI" <> 0 OR "NYERI" <> 0 OR "KAKAMEGA" <> 0 OR "HILTON" <> 0
+      OR "JUMIA" <> 0 OR "MRKT" <> 0 OR "SINZA" <> 0 OR "UGANDA" <> 0
+      OR "KISII" <> 0 OR "KTDA" <> 0 OR "KTDA NEW" <> 0 OR "BUSIA" <> 0
+      OR "RONGAI" <> 0 OR "CORPORATE" <> 0 OR "DENRI SHOPS" <> 0)
+),
+
+family_map AS (
+  SELECT DISTINCT bag_name, SPLIT_PART(bag_name, ' ', 1) AS family
+  FROM pivoted_valued
+),
+family_subtotals AS (
+  SELECT
+    f.family || ' TOTAL' AS bag_name,
+    SUM(p."STARMALL")   AS "STARMALL", SUM(p."MOMBASA")  AS "MOMBASA",
+    SUM(p."NAKURU")     AS "NAKURU",   SUM(p."ELDORET")  AS "ELDORET",
+    SUM(p."KISUMU")     AS "KISUMU",   SUM(p."MERU")     AS "MERU",
+    SUM(p."THIKA")      AS "THIKA",    SUM(p."HAZINA")   AS "HAZINA",
+    SUM(p."KITENGELA")  AS "KITENGELA",SUM(p."WEBSITE")  AS "WEBSITE",
+    SUM(p."NANYUKI")    AS "NANYUKI", SUM(p."NYERI") AS "NYERI",  SUM(p."KAKAMEGA") AS "KAKAMEGA",
+    SUM(p."HILTON")     AS "HILTON",   SUM(p."JUMIA")    AS "JUMIA",
+    SUM(p."MRKT")       AS "MRKT",     SUM(p."SINZA")    AS "SINZA",
+    SUM(p."UGANDA")     AS "UGANDA",   SUM(p."KISII")    AS "KISII",
+    SUM(p."KTDA")       AS "KTDA",     SUM(p."KTDA NEW") AS "KTDA NEW",
+    SUM(p."BUSIA")      AS "BUSIA",    SUM(p."RONGAI")   AS "RONGAI",
+    SUM(p."CORPORATE")  AS "CORPORATE",
+    SUM(p."DENRI SHOPS") AS "DENRI SHOPS"
+  FROM pivoted_valued p
+  JOIN family_map f ON p.bag_name = f.bag_name
+  GROUP BY f.family
+),
+grand_total AS (
+  SELECT
+    'GRAND TOTAL' AS bag_name,
+    SUM("STARMALL")   AS "STARMALL", SUM("MOMBASA")  AS "MOMBASA",
+    SUM("NAKURU")     AS "NAKURU",   SUM("ELDORET")  AS "ELDORET",
+    SUM("KISUMU")     AS "KISUMU",   SUM("MERU")     AS "MERU",
+    SUM("THIKA")      AS "THIKA",    SUM("HAZINA")   AS "HAZINA",
+    SUM("KITENGELA")  AS "KITENGELA",SUM("WEBSITE")  AS "WEBSITE",
+    SUM("NANYUKI")    AS "NANYUKI", SUM("NYERI") AS "NYERI",  SUM("KAKAMEGA") AS "KAKAMEGA",
+    SUM("HILTON")     AS "HILTON",   SUM("JUMIA")    AS "JUMIA",
+    SUM("MRKT")       AS "MRKT",     SUM("SINZA")    AS "SINZA",
+    SUM("UGANDA")     AS "UGANDA",   SUM("KISII")    AS "KISII",
+    SUM("KTDA")       AS "KTDA",     SUM("KTDA NEW") AS "KTDA NEW",
+    SUM("BUSIA")      AS "BUSIA",    SUM("RONGAI")   AS "RONGAI",
+    SUM("CORPORATE")  AS "CORPORATE",
+    SUM("DENRI SHOPS") AS "DENRI SHOPS"
+  FROM pivoted_valued
+),
+combined AS (
+  SELECT p.bag_name,
+    "STARMALL","MOMBASA","NAKURU","ELDORET","KISUMU","MERU","THIKA","HAZINA",
+    "KITENGELA","WEBSITE","NANYUKI","NYERI","KAKAMEGA","HILTON","JUMIA","MRKT","SINZA","UGANDA",
+    "KISII","KTDA","KTDA NEW","BUSIA","RONGAI","CORPORATE","DENRI SHOPS",
+    js.src_txt AS jumia_src_txt, ms.src_txt AS mrkt_src_txt,
+    SPLIT_PART(p.bag_name, ' ', 1) AS family, 0 AS sort_order
+  FROM pivoted_valued p
+  LEFT JOIN jumia_src js ON js.bag_name = p.bag_name
+  LEFT JOIN mrkt_src  ms ON ms.bag_name = p.bag_name
+  UNION ALL
+  SELECT bag_name,
+    "STARMALL","MOMBASA","NAKURU","ELDORET","KISUMU","MERU","THIKA","HAZINA",
+    "KITENGELA","WEBSITE","NANYUKI","NYERI","KAKAMEGA","HILTON","JUMIA","MRKT","SINZA","UGANDA",
+    "KISII","KTDA","KTDA NEW","BUSIA","RONGAI","CORPORATE","DENRI SHOPS",
+    NULL, NULL,
+    bag_name AS family, 1 AS sort_order
+  FROM family_subtotals
+  UNION ALL
+  SELECT bag_name,
+    "STARMALL","MOMBASA","NAKURU","ELDORET","KISUMU","MERU","THIKA","HAZINA",
+    "KITENGELA","WEBSITE","NANYUKI","NYERI","KAKAMEGA","HILTON","JUMIA","MRKT","SINZA","UGANDA",
+    "KISII","KTDA","KTDA NEW","BUSIA","RONGAI","CORPORATE","DENRI SHOPS",
+    NULL, NULL,
+    '~~~~' AS family, 2 AS sort_order
+  FROM grand_total
+)
+
+SELECT
+  bag_name AS "Product",
+  "STARMALL","MOMBASA","NAKURU","ELDORET","KISUMU","MERU","THIKA","HAZINA",
+  "KITENGELA","WEBSITE","NANYUKI","NYERI","KAKAMEGA","HILTON","JUMIA","MRKT","SINZA","UGANDA",
+  "KISII","KTDA","KTDA NEW","BUSIA","RONGAI",
+  ("STARMALL"+"MOMBASA"+"NAKURU"+"ELDORET"+"KISUMU"+"MERU"+"THIKA"+"HAZINA"+
+   "KITENGELA"+"WEBSITE"+"NANYUKI"+"NYERI"+"KAKAMEGA"+"HILTON"+"JUMIA"+"MRKT"+"SINZA"+"UGANDA"+
+   "KISII"+"KTDA"+"KTDA NEW"+"BUSIA"+"RONGAI") AS "TOTAL",
+  "CORPORATE",
+  "DENRI SHOPS",
+  CASE WHEN "JUMIA" <> 0 THEN "JUMIA" || ' (' || COALESCE(jumia_src_txt,'') || ')' END AS "JUMIA SRC",
+  CASE WHEN "MRKT"  <> 0 THEN "MRKT"  || ' (' || COALESCE(mrkt_src_txt,'')  || ')' END AS "MRKT SRC",
+  family AS "Family",
+  sort_order
+FROM combined
+ORDER BY family, sort_order, bag_name;
+"""
+
+# Destination x source split behind COMBINED_DISTRIBUTION's shop totals — one
+# row per bag/destination/source, so the page can chart who supplied each
+# shop (Direct from the warehouse, or via CBD/HTN) without a second round
+# trip. Reuses the exact same receipt/forward CTEs COMBINED_DISTRIBUTION
+# builds its pivoted totals from, just left in long form instead of pivoted —
+# the same moves counted the same way, so the two queries cannot disagree.
+# Starmall/Hazina are absent on purpose: they run on the v2 basis and are not
+# part of the Direct/CBD/HTN chart (see views.py's chart_cols).
+COMBINED_DISTRIBUTION_BREAKDOWN = """
+WITH params AS (
+  SELECT
+    CAST(:start_date AS DATE) AS start_date,
+    CAST(:end_date AS DATE) AS end_date
+),
+moves AS MATERIALIZED (
+  SELECT
+    m.id, m.state, m.product_qty AS qty, DATE(m."date") AS move_date,
+    EXTRACT(DOW FROM m."date") = 0 AS is_sunday,
+    src.complete_name AS src_path, dest.complete_name AS dest_path,
+    COALESCE(pt."name", pp.id::text) AS bag_name
+  FROM stock_move m
+  JOIN stock_location src  ON m.location_id = src.id
+  JOIN stock_location dest ON m.location_dest_id = dest.id
+  JOIN product_product pp  ON m.product_id = pp.id
+  LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  CROSS JOIN params p
+  WHERE DATE(m."date") BETWEEN p.start_date AND p.end_date
+    AND COALESCE(pt."name",'') NOT LIKE '%+%'
+),
+receipts_raw AS (
+  SELECT
+    m.bag_name,
+    CASE
+      WHEN m.dest_path ILIKE '%MSA/Stock%'    THEN 'MOMBASA'
+      WHEN m.dest_path ILIKE '%NAKS/Stock%'   THEN 'NAKURU'
+      WHEN m.dest_path ILIKE '%ELD/Stock%'    THEN 'ELDORET'
+      WHEN m.dest_path ILIKE '%KSM/Stock%'    THEN 'KISUMU'
+      WHEN m.dest_path ILIKE '%MERU/Stock%'   THEN 'MERU'
+      WHEN m.dest_path ILIKE '%THK/Stock%'    THEN 'THIKA'
+      WHEN m.dest_path ILIKE '%KITE/Stock%'   THEN 'KITENGELA'
+      WHEN m.dest_path ILIKE '%NAN/Stock%'    THEN 'NANYUKI'
+      WHEN m.dest_path ILIKE '%NYERI/Stock%'    THEN 'NYERI'
+      WHEN m.dest_path ILIKE '%KAK/Stock%'    THEN 'KAKAMEGA'
+      WHEN m.dest_path ILIKE '%KSI/Stock%'    THEN 'KISII'
+      WHEN m.dest_path ILIKE '%BUSIA/Stock%'  THEN 'BUSIA'
+      WHEN m.dest_path ILIKE '%RONG/Stock%'   THEN 'RONGAI'
+      WHEN m.dest_path ILIKE '%JUMIA%'        THEN 'JUMIA'
+      WHEN m.dest_path ILIKE '%MRKT%' OR m.dest_path ILIKE '%MARKET%' THEN 'MRKT'
+      WHEN m.dest_path ILIKE '%WEB/Stock%' OR m.dest_path ILIKE '%WEBSITE%' THEN 'WEBSITE'
+      ELSE NULL
+    END AS dest_name,
+    m.qty, m.move_date
+  FROM moves m
+  WHERE m.src_path ILIKE 'FINWH/Goods in Transit/%'
+    AND m.state = 'done'
+    AND NOT m.is_sunday
+    AND m.dest_path NOT ILIKE '%DAR%' AND m.dest_path NOT ILIKE '%SINZA%'
+    AND m.dest_path NOT ILIKE '%UG/Stock%' AND m.dest_path NOT ILIKE '%UGANDA%'
+    AND m.dest_path NOT ILIKE '%CBD/Stock%' AND m.dest_path NOT ILIKE '%KTDA/Stock%'
+    AND m.dest_path NOT ILIKE '%HTN/Stock%'
+),
+ktda_receipts AS (
+  SELECT m.bag_name, 'KTDA' AS dest_name, m.qty, m.move_date
+  FROM moves m
+  WHERE m.src_path ILIKE 'FINWH/Goods in Transit%' AND m.dest_path ILIKE '%CBD/Stock%' AND m.state = 'done'
+),
+cbd_out_to_shops_raw AS (
+  SELECT
+    m.bag_name,
+    CASE
+      WHEN m.dest_path ILIKE '%MSA/Stock%'    THEN 'MOMBASA'
+      WHEN m.dest_path ILIKE '%NAKS/Stock%'   THEN 'NAKURU'
+      WHEN m.dest_path ILIKE '%ELD/Stock%'    THEN 'ELDORET'
+      WHEN m.dest_path ILIKE '%KSM/Stock%'    THEN 'KISUMU'
+      WHEN m.dest_path ILIKE '%MERU/Stock%'   THEN 'MERU'
+      WHEN m.dest_path ILIKE '%THK/Stock%'    THEN 'THIKA'
+      WHEN m.dest_path ILIKE '%KITE/Stock%'   THEN 'KITENGELA'
+      WHEN m.dest_path ILIKE '%NAN/Stock%'    THEN 'NANYUKI'
+      WHEN m.dest_path ILIKE '%NYERI/Stock%'    THEN 'NYERI'
+      WHEN m.dest_path ILIKE '%KAK/Stock%'    THEN 'KAKAMEGA'
+      WHEN m.dest_path ILIKE '%KSI/Stock%'    THEN 'KISII'
+      WHEN m.dest_path ILIKE '%BUSIA/Stock%'  THEN 'BUSIA'
+      WHEN m.dest_path ILIKE '%RONG%'         THEN 'RONGAI'
+      WHEN m.dest_path ILIKE '%HTN/Stock%'    THEN 'HILTON'
+      WHEN m.dest_path ILIKE '%JUMIA%'        THEN 'JUMIA'
+      WHEN m.dest_path ILIKE '%MRKT%' OR m.dest_path ILIKE '%MARKET%' THEN 'MRKT'
+      ELSE NULL
+    END AS dest_name,
+    m.qty, m.state AS move_state, m.move_date
+  FROM moves m
+  WHERE m.src_path ILIKE '%CBD/Stock%'
+    AND m.dest_path NOT ILIKE '%CBD/Stock%' AND m.dest_path NOT ILIKE '%KTDA/Stock%'
+    AND m.dest_path NOT ILIKE '%SINZA%' AND m.dest_path NOT ILIKE '%DAR%'
+    AND m.dest_path NOT ILIKE '%UGANDA%' AND m.dest_path NOT ILIKE '%UG/Stock%'
+    AND m.state != 'cancel'
+),
+v2_hilton_forward AS (
+  SELECT
+    m.bag_name,
+    CASE
+      WHEN m.dest_path ILIKE '%MSA/Stock%'    THEN 'MOMBASA'
+      WHEN m.dest_path ILIKE '%NAKS/Stock%'   THEN 'NAKURU'
+      WHEN m.dest_path ILIKE '%ELD/Stock%'    THEN 'ELDORET'
+      WHEN m.dest_path ILIKE '%KSM/Stock%'    THEN 'KISUMU'
+      WHEN m.dest_path ILIKE '%MERU/Stock%'   THEN 'MERU'
+      WHEN m.dest_path ILIKE '%THK/Stock%'    THEN 'THIKA'
+      WHEN m.dest_path ILIKE '%KITE/Stock%'   THEN 'KITENGELA'
+      WHEN m.dest_path ILIKE '%NAN/Stock%'    THEN 'NANYUKI'
+      WHEN m.dest_path ILIKE '%NYERI/Stock%'    THEN 'NYERI'
+      WHEN m.dest_path ILIKE '%KAK/Stock%'    THEN 'KAKAMEGA'
+      WHEN m.dest_path ILIKE '%KSI/Stock%'    THEN 'KISII'
+      WHEN m.dest_path ILIKE '%BUSIA/Stock%'  THEN 'BUSIA'
+      WHEN m.dest_path ILIKE '%RONG%'         THEN 'RONGAI'
+      WHEN m.dest_path ILIKE '%JUMIA%'        THEN 'JUMIA'
+      WHEN m.dest_path ILIKE '%CBD/Stock%' OR m.dest_path ILIKE '%KTDA%'
+        OR m.dest_path ILIKE '%WEB/Stock%' OR m.dest_path ILIKE '%WEBSITE%' THEN 'KTDA'
+      ELSE NULL
+    END AS dest_name,
+    m.qty, m.move_date
+  FROM moves m
+  WHERE m.src_path ILIKE '%HTN/Stock%'
+    AND m.dest_path NOT ILIKE '%HTN/Stock%' AND m.dest_path NOT ILIKE '%SINZA%'
+    AND m.dest_path NOT ILIKE '%DAR%' AND m.dest_path NOT ILIKE '%UGANDA%'
+    AND m.dest_path NOT ILIKE '%UG/Stock%' AND m.state != 'cancel'
+),
+breakdown_moves AS (
+  SELECT bag_name, dest_name, 'Direct' AS source, qty FROM receipts_raw WHERE dest_name IS NOT NULL
+  UNION ALL
+  SELECT bag_name, dest_name, 'Direct', qty FROM ktda_receipts
+  UNION ALL
+  SELECT bag_name, dest_name, 'CBD', qty FROM cbd_out_to_shops_raw WHERE dest_name IS NOT NULL AND move_state = 'done'
+  UNION ALL
+  SELECT bag_name, dest_name, 'HTN', qty FROM v2_hilton_forward WHERE dest_name IS NOT NULL
+)
+SELECT
+  bag_name AS "Product",
+  dest_name AS "Destination",
+  source AS "Source",
+  SUM(qty) AS "Qty"
+FROM breakdown_moves
+GROUP BY bag_name, dest_name, source
+HAVING SUM(qty) <> 0;
+"""
+
+# What CBD and HTN each handed on, at bag grain — one row per bag/destination
+# they forwarded to. Reuses the same cbd_out_to_shops_raw / v2_hilton_forward
+# CTEs as COMBINED_DISTRIBUTION_BREAKDOWN so the hub tally on the Combined
+# Distribution page can never disagree with the shop-level source split above.
+HUB_OUTFLOW = """
+WITH params AS (
+  SELECT
+    CAST(:start_date AS DATE) AS start_date,
+    CAST(:end_date AS DATE) AS end_date
+),
+moves AS MATERIALIZED (
+  SELECT
+    m.id, m.state, m.product_qty AS qty, DATE(m."date") AS move_date,
+    src.complete_name AS src_path, dest.complete_name AS dest_path,
+    COALESCE(pt."name", pp.id::text) AS bag_name
+  FROM stock_move m
+  JOIN stock_location src  ON m.location_id = src.id
+  JOIN stock_location dest ON m.location_dest_id = dest.id
+  JOIN product_product pp  ON m.product_id = pp.id
+  LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  CROSS JOIN params p
+  WHERE DATE(m."date") BETWEEN p.start_date AND p.end_date
+    AND COALESCE(pt."name",'') NOT LIKE '%+%'
+),
+cbd_out_to_shops_raw AS (
+  SELECT
+    m.bag_name,
+    CASE
+      WHEN m.dest_path ILIKE '%MSA/Stock%'    THEN 'MOMBASA'
+      WHEN m.dest_path ILIKE '%NAKS/Stock%'   THEN 'NAKURU'
+      WHEN m.dest_path ILIKE '%ELD/Stock%'    THEN 'ELDORET'
+      WHEN m.dest_path ILIKE '%KSM/Stock%'    THEN 'KISUMU'
+      WHEN m.dest_path ILIKE '%MERU/Stock%'   THEN 'MERU'
+      WHEN m.dest_path ILIKE '%THK/Stock%'    THEN 'THIKA'
+      WHEN m.dest_path ILIKE '%HAZ/Stock%'    THEN 'HAZINA'
+      WHEN m.dest_path ILIKE '%KITE/Stock%'   THEN 'KITENGELA'
+      WHEN m.dest_path ILIKE '%NAN/Stock%'    THEN 'NANYUKI'
+      WHEN m.dest_path ILIKE '%NYERI/Stock%'    THEN 'NYERI'
+      WHEN m.dest_path ILIKE '%KAK/Stock%'    THEN 'KAKAMEGA'
+      WHEN m.dest_path ILIKE '%KSI/Stock%'    THEN 'KISII'
+      WHEN m.dest_path ILIKE '%BUSIA/Stock%'  THEN 'BUSIA'
+      WHEN m.dest_path ILIKE '%RONG%'         THEN 'RONGAI'
+      WHEN m.dest_path ILIKE '%STAR/Stock%'   THEN 'STARMALL'
+      WHEN m.dest_path ILIKE '%HTN/Stock%'    THEN 'HILTON'
+      WHEN m.dest_path ILIKE '%CORP/Stock%'   THEN 'CORPORATE'
+      WHEN m.dest_path ILIKE '%MRKT%' OR m.dest_path ILIKE '%MARKET%' THEN 'MRKT'
+      WHEN m.dest_path ILIKE '%JUMIA%'        THEN 'JUMIA'
+      WHEN m.dest_path ILIKE '%WEB/Stock%' OR m.dest_path ILIKE '%WEBSITE%' THEN 'WEBSITE'
+      ELSE NULL
+    END AS dest_name,
+    m.qty, m.state AS move_state
+  FROM moves m
+  WHERE m.src_path ILIKE '%CBD/Stock%'
+    AND m.dest_path NOT ILIKE '%CBD/Stock%' AND m.dest_path NOT ILIKE '%KTDA/Stock%'
+    AND m.dest_path NOT ILIKE '%SINZA%' AND m.dest_path NOT ILIKE '%DAR%'
+    AND m.dest_path NOT ILIKE '%UGANDA%' AND m.dest_path NOT ILIKE '%UG/Stock%'
+    AND m.state != 'cancel'
+),
+v2_hilton_forward AS (
+  SELECT
+    m.bag_name,
+    CASE
+      WHEN m.dest_path ILIKE '%MSA/Stock%'    THEN 'MOMBASA'
+      WHEN m.dest_path ILIKE '%NAKS/Stock%'   THEN 'NAKURU'
+      WHEN m.dest_path ILIKE '%ELD/Stock%'    THEN 'ELDORET'
+      WHEN m.dest_path ILIKE '%KSM/Stock%'    THEN 'KISUMU'
+      WHEN m.dest_path ILIKE '%MERU/Stock%'   THEN 'MERU'
+      WHEN m.dest_path ILIKE '%THK/Stock%'    THEN 'THIKA'
+      WHEN m.dest_path ILIKE '%HAZ/Stock%'    THEN 'HAZINA'
+      WHEN m.dest_path ILIKE '%KITE/Stock%'   THEN 'KITENGELA'
+      WHEN m.dest_path ILIKE '%NAN/Stock%'    THEN 'NANYUKI'
+      WHEN m.dest_path ILIKE '%NYERI/Stock%'    THEN 'NYERI'
+      WHEN m.dest_path ILIKE '%KAK/Stock%'    THEN 'KAKAMEGA'
+      WHEN m.dest_path ILIKE '%KSI/Stock%'    THEN 'KISII'
+      WHEN m.dest_path ILIKE '%BUSIA/Stock%'  THEN 'BUSIA'
+      WHEN m.dest_path ILIKE '%RONG%'         THEN 'RONGAI'
+      WHEN m.dest_path ILIKE '%STAR/Stock%'   THEN 'STARMALL'
+      WHEN m.dest_path ILIKE '%CORP/Stock%'   THEN 'CORPORATE'
+      WHEN m.dest_path ILIKE '%MRKT%' OR m.dest_path ILIKE '%MARKET%' THEN 'MRKT'
+      WHEN m.dest_path ILIKE '%JUMIA%'        THEN 'JUMIA'
+      WHEN m.dest_path ILIKE '%CBD/Stock%' OR m.dest_path ILIKE '%KTDA%'
+        OR m.dest_path ILIKE '%WEB/Stock%' OR m.dest_path ILIKE '%WEBSITE%' THEN 'KTDA'
+      ELSE NULL
+    END AS dest_name,
+    m.qty
+  FROM moves m
+  WHERE m.src_path ILIKE '%HTN/Stock%'
+    AND m.dest_path NOT ILIKE '%HTN/Stock%' AND m.dest_path NOT ILIKE '%SINZA%'
+    AND m.dest_path NOT ILIKE '%DAR%' AND m.dest_path NOT ILIKE '%UGANDA%'
+    AND m.dest_path NOT ILIKE '%UG/Stock%' AND m.state != 'cancel'
+),
+hub_moves AS (
+  SELECT bag_name, dest_name, 'CBD' AS source, qty FROM cbd_out_to_shops_raw
+  WHERE dest_name IS NOT NULL AND move_state = 'done'
+  UNION ALL
+  SELECT bag_name, dest_name, 'HTN' AS source, qty FROM v2_hilton_forward
+  WHERE dest_name IS NOT NULL
+)
+SELECT
+  bag_name AS "Product",
+  dest_name AS "Sent to",
+  source AS "Source",
+  SUM(qty) AS "Qty"
+FROM hub_moves
+GROUP BY bag_name, dest_name, source
+HAVING SUM(qty) <> 0;
+"""
+
+# What LEFT the warehouse: stock moves (FINWH inventory transfers, shop
+# transit dispatches, internal CBD<->KTDA moves), CBD's onward sends to shops
+# (toggled by :include_cbd), and sales-order dispatch to Sinza/Uganda, pivoted
+# by destination with product-family subtotals and a grand total. Sundays are
+# excluded from the warehouse streams but not the CBD stream — CBD does hand
+# stock on a Sunday, and dropping it would make Goods in Transit go negative
+# for every bag CBD moved on one.
+DISPATCH_COMBINED = """
+WITH params AS (
+  SELECT
+    CAST(:start_date AS DATE) AS start_date,
+    CAST(:end_date AS DATE) AS end_date,
+    CAST(:include_cbd AS BOOLEAN) AS include_cbd
+),
+
+code_mapping AS (
+  SELECT 'STAR' AS code, 'STARMALL' AS full_name
+  UNION ALL SELECT 'STARMALL', 'STARMALL'
+  UNION ALL SELECT 'MSA', 'MOMBASA'
+  UNION ALL SELECT 'MOMBASA', 'MOMBASA'
+  UNION ALL SELECT 'NAKS', 'NAKURU'
+  UNION ALL SELECT 'NAKURU', 'NAKURU'
+  UNION ALL SELECT 'ELD', 'ELDORET'
+  UNION ALL SELECT 'ELDORET', 'ELDORET'
+  UNION ALL SELECT 'KSM', 'KISUMU'
+  UNION ALL SELECT 'KISUMU', 'KISUMU'
+  UNION ALL SELECT 'MERU', 'MERU'
+  UNION ALL SELECT 'THK', 'THIKA'
+  UNION ALL SELECT 'THIKA', 'THIKA'
+  UNION ALL SELECT 'HAZ', 'HAZINA'
+  UNION ALL SELECT 'HAZINA', 'HAZINA'
+  UNION ALL SELECT 'KITE', 'KITENGELA'
+  UNION ALL SELECT 'KITENGELA', 'KITENGELA'
+  UNION ALL SELECT 'RONG', 'RONGAI'
+  UNION ALL SELECT 'RONGAI', 'RONGAI'
+  UNION ALL SELECT 'NAN', 'NANYUKI'
+  UNION ALL SELECT 'NANYUKI', 'NANYUKI'
+  UNION ALL SELECT 'NYERI', 'NYERI'
+  UNION ALL SELECT 'KAK', 'KAKAMEGA'
+  UNION ALL SELECT 'KAKAMEGA', 'KAKAMEGA'
+  UNION ALL SELECT 'HTN', 'HILTON'
+  UNION ALL SELECT 'HILTON', 'HILTON'
+  UNION ALL SELECT 'DAR', 'SINZA'
+  UNION ALL SELECT 'SINZA', 'SINZA'
+  UNION ALL SELECT 'UG', 'UGANDA'
+  UNION ALL SELECT 'UGANDA', 'UGANDA'
+  UNION ALL SELECT 'KSI', 'KISII'
+  UNION ALL SELECT 'KISII', 'KISII'
+  UNION ALL SELECT 'KTDA', 'KTDA'
+  UNION ALL SELECT 'CBD', 'KTDA'
+  UNION ALL SELECT 'BUSIA', 'BUSIA'
+),
+
+-- STREAM 1 — FINWH INVENTORY MOVES
+finwh_inventory AS (
+  SELECT
+    COALESCE(pt."name", pp.id::text) AS bag_name,
+    COALESCE(
+      cm.full_name,
+      CASE
+        WHEN dest.complete_name ILIKE '%CBD%' OR UPPER(dest."name") IN ('CBD', 'CBD/STOCK', 'KTDA') THEN 'KTDA'
+        WHEN dest.complete_name ILIKE '%RONG%' OR UPPER(dest."name") IN ('RONGAI', 'RONG/STOCK') THEN 'RONGAI'
+        WHEN UPPER(dest."name") = 'STARMALL' THEN 'STARMALL'
+        WHEN UPPER(dest."name") = 'MOMBASA' THEN 'MOMBASA'
+        WHEN UPPER(dest."name") = 'NAKURU' THEN 'NAKURU'
+        WHEN UPPER(dest."name") = 'ELDORET' THEN 'ELDORET'
+        WHEN UPPER(dest."name") = 'KISUMU' THEN 'KISUMU'
+        WHEN UPPER(dest."name") = 'MERU' THEN 'MERU'
+        WHEN UPPER(dest."name") = 'THIKA' THEN 'THIKA'
+        WHEN UPPER(dest."name") = 'HAZINA' THEN 'HAZINA'
+        WHEN UPPER(dest."name") = 'KITENGELA' THEN 'KITENGELA'
+        WHEN UPPER(dest."name") = 'NANYUKI' THEN 'NANYUKI'
+        WHEN UPPER(dest."name") = 'NYERI' THEN 'NYERI'
+        WHEN UPPER(dest."name") = 'KAKAMEGA' THEN 'KAKAMEGA'
+        WHEN UPPER(dest."name") = 'HILTON' THEN 'HILTON'
+        WHEN UPPER(dest."name") = 'SINZA' THEN 'SINZA'
+        WHEN UPPER(dest."name") = 'UGANDA' THEN 'UGANDA'
+        WHEN UPPER(dest."name") = 'KISII' THEN 'KISII'
+        WHEN UPPER(dest."name") = 'BUSIA' THEN 'BUSIA'
+        ELSE dest."name"
+      END
+    ) AS dest_name,
+    m.product_qty AS qty,
+    m.state AS move_state,
+    DATE(m."date") AS move_date
+  FROM stock_move m
+  JOIN stock_location src ON m.location_id = src.id
+  JOIN stock_location dest ON m.location_dest_id = dest.id
+  JOIN product_product pp ON m.product_id = pp.id
+  LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  LEFT JOIN code_mapping cm ON UPPER(SPLIT_PART(COALESCE(m.reference, m."name"), '/', 1)) = cm.code
+  CROSS JOIN params p
+  WHERE (UPPER(src."name") IN ('FINWH', 'FINWH/STOCK') OR src.complete_name ILIKE '%FINWH%')
+    AND src.complete_name NOT ILIKE '%Goods in Transit%'
+    AND (
+      UPPER(dest."name") IN (
+        'STARMALL','MOMBASA','NAKURU','ELDORET','KISUMU','MERU','THIKA','HAZINA',
+        'KITENGELA','WEBSITE','NANYUKI','NYERI','KAKAMEGA','HILTON','SINZA','UGANDA',
+        'KISII','CBD','CBD/STOCK','BUSIA','RONGAI'
+      )
+      OR dest.complete_name ILIKE '%CBD%'
+      OR dest.complete_name ILIKE '%RONG%'
+      OR UPPER(SPLIT_PART(COALESCE(m.reference, m."name"), '/', 1)) IN (
+        'STAR','MSA','NAKS','ELD','KSM','MERU','THK','HAZ','KITE','RONG','NAN',
+        'KAK','HTN','DAR','UG','KSI','KTDA','BUSIA','CBD','STARMALL','MOMBASA',
+        'NAKURU','ELDORET','KISUMU','THIKA','HAZINA','KITENGELA','RONGAI',
+        'NANYUKI','NYERI','KAKAMEGA','HILTON','SINZA','UGANDA','KISII'
+      )
+    )
+    AND DATE(m."date") BETWEEN p.start_date AND p.end_date
+    AND EXTRACT(DOW FROM m."date") != 0
+),
+finwh_filtered AS (
+  SELECT bag_name, dest_name, qty, move_date, NULL::int AS dedup_key
+  FROM finwh_inventory
+  WHERE dest_name NOT IN ('SINZA', 'UGANDA')
+    AND move_state != 'cancel'
+),
+
+-- STREAM 2 — SHOP TRANSIT DISPATCHES
+transit_moves AS (
+  SELECT
+    COALESCE(pt."name", pp.id::text) AS bag_name,
+    CASE
+      WHEN UPPER(s."name") = 'KTDA SHOP' OR s."name" ILIKE '%CBD%' THEN 'KTDA'
+      WHEN s."name" ILIKE '%RONG%' THEN 'RONGAI'
+      WHEN UPPER(s."name") = 'STARMALL' THEN 'STARMALL'
+      WHEN UPPER(s."name") = 'MOMBASA' THEN 'MOMBASA'
+      WHEN UPPER(s."name") = 'NAKURU' THEN 'NAKURU'
+      WHEN UPPER(s."name") = 'ELDORET' THEN 'ELDORET'
+      WHEN UPPER(s."name") = 'KISUMU' THEN 'KISUMU'
+      WHEN UPPER(s."name") = 'MERU' THEN 'MERU'
+      WHEN UPPER(s."name") = 'THIKA' THEN 'THIKA'
+      WHEN UPPER(s."name") = 'HAZINA' THEN 'HAZINA'
+      WHEN UPPER(s."name") = 'KITENGELA' THEN 'KITENGELA'
+      WHEN UPPER(s."name") = 'NANYUKI' THEN 'NANYUKI'
+      WHEN UPPER(s."name") = 'NYERI' THEN 'NYERI'
+      WHEN UPPER(s."name") = 'KAKAMEGA' THEN 'KAKAMEGA'
+      WHEN UPPER(s."name") = 'HILTON' THEN 'HILTON'
+      WHEN UPPER(s."name") = 'SINZA' THEN 'SINZA'
+      WHEN UPPER(s."name") = 'UGANDA' THEN 'UGANDA'
+      WHEN UPPER(s."name") = 'KISII' THEN 'KISII'
+      WHEN UPPER(s."name") = 'BUSIA' THEN 'BUSIA'
+      ELSE s."name"
+    END AS dest_name,
+    l.qty_dispatched AS qty,
+    t.state AS transit_state,
+    DATE(t.dispatch_date) AS move_date
+  FROM denri_dispatch_transit_line l
+  JOIN denri_dispatch_transit t ON l.transit_id = t.id
+  JOIN denri_dispatch_shop s ON t.shop_id = s.id
+  JOIN product_product pp ON l.product_id = pp.id
+  LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  CROSS JOIN params p
+  WHERE (
+      UPPER(s."name") IN (
+        'STARMALL','MOMBASA','NAKURU','ELDORET','KISUMU','MERU','THIKA','HAZINA',
+        'KITENGELA','WEBSITE','NANYUKI','NYERI','KAKAMEGA','HILTON','SINZA','UGANDA',
+        'KISII','KTDA SHOP','BUSIA','RONGAI'
+      )
+      OR s."name" ILIKE '%CBD%'
+      OR s."name" ILIKE '%RONG%'
+    )
+    AND DATE(t.dispatch_date) BETWEEN p.start_date AND p.end_date
+    AND EXTRACT(DOW FROM t.dispatch_date) != 0
+),
+transit_filtered AS (
+  SELECT bag_name, dest_name, qty, move_date, NULL::int AS dedup_key
+  FROM transit_moves
+  WHERE dest_name NOT IN ('SINZA', 'UGANDA')
+),
+
+-- STREAM 3 — CBD/Stock onward sends to shops, RECEIVED only. Switched on or
+-- off by :include_cbd, so the same report reads as pure warehouse dispatch or
+-- as dispatch plus hub redistribution. No Sunday filter: CBD is a hub and
+-- does hand stock on a Sunday, matching Combined Distribution, which counts
+-- the same moves — dropping Sundays here would make Goods in Transit
+-- (dispatch minus combined) go negative for every bag CBD moved on one.
+cbd_sends AS (
+  SELECT
+    COALESCE(pt."name", pp.id::text) AS bag_name,
+    CASE
+      WHEN dest.complete_name ILIKE '%MSA/Stock%'    THEN 'MOMBASA'
+      WHEN dest.complete_name ILIKE '%NAKS/Stock%'   THEN 'NAKURU'
+      WHEN dest.complete_name ILIKE '%ELD/Stock%'    THEN 'ELDORET'
+      WHEN dest.complete_name ILIKE '%KSM/Stock%'    THEN 'KISUMU'
+      WHEN dest.complete_name ILIKE '%MERU/Stock%'   THEN 'MERU'
+      WHEN dest.complete_name ILIKE '%THK/Stock%'    THEN 'THIKA'
+      WHEN dest.complete_name ILIKE '%HAZ/Stock%'    THEN 'HAZINA'
+      WHEN dest.complete_name ILIKE '%KITE/Stock%'   THEN 'KITENGELA'
+      WHEN dest.complete_name ILIKE '%NAN/Stock%'    THEN 'NANYUKI'
+      WHEN dest.complete_name ILIKE '%NYERI/Stock%'    THEN 'NYERI'
+      WHEN dest.complete_name ILIKE '%KAK/Stock%'    THEN 'KAKAMEGA'
+      WHEN dest.complete_name ILIKE '%KSI/Stock%'    THEN 'KISII'
+      WHEN dest.complete_name ILIKE '%BUSIA/Stock%'  THEN 'BUSIA'
+      WHEN dest.complete_name ILIKE '%RONG%'         THEN 'RONGAI'
+      WHEN dest.complete_name ILIKE '%STAR/Stock%'   THEN 'STARMALL'
+      WHEN dest.complete_name ILIKE '%HTN/Stock%'    THEN 'HILTON'
+      ELSE NULL
+    END AS dest_name,
+    m.product_qty AS qty,
+    DATE(m."date") AS move_date,
+    m.id AS dedup_key
+  FROM stock_move m
+  JOIN stock_location src  ON m.location_id = src.id
+  JOIN stock_location dest ON m.location_dest_id = dest.id
+  JOIN product_product pp  ON m.product_id = pp.id
+  LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  CROSS JOIN params p
+  WHERE src.complete_name ILIKE '%CBD/Stock%'
+    AND dest.complete_name NOT ILIKE '%CBD/Stock%'
+    AND dest.complete_name NOT ILIKE '%KTDA%'
+    AND dest.complete_name NOT ILIKE '%SINZA%'
+    AND dest.complete_name NOT ILIKE '%DAR%'
+    AND dest.complete_name NOT ILIKE '%UGANDA%'
+    AND dest.complete_name NOT ILIKE '%UG/Stock%'
+    AND m.state = 'done'
+    AND COALESCE(pt."name",'') NOT LIKE '%+%'
+    AND DATE(m."date") BETWEEN p.start_date AND p.end_date
+),
+cbd_filtered AS (
+  SELECT bag_name, dest_name, qty, move_date, dedup_key
+  FROM cbd_sends, params p
+  WHERE dest_name IS NOT NULL
+    AND p.include_cbd
+),
+
+-- STREAM 4 — INTERNAL CBD <-> KTDA MOVES. Deliberately narrow: CBD/Stock <->
+-- KTDA/Stock and nothing else, matching ktda_new in COMBINED_DISTRIBUTION so
+-- the two sides measure one thing. A wildcard on '%CBD%' would also match the
+-- RECEIPT leg of every warehouse delivery to KTDA, already counted in
+-- Combined Distribution's KTDA column via ktda_receipts, and counting it
+-- again here would report the same bags twice.
+ktda_internal AS (
+  SELECT
+    COALESCE(pt."name", pp.id::text) AS bag_name,
+    'KTDA NEW' AS dest_name,
+    CASE WHEN src.complete_name ILIKE '%KTDA/Stock%'
+         THEN -m.product_qty ELSE m.product_qty END AS qty,
+    DATE(m."date") AS move_date,
+    m.id AS dedup_key
+  FROM stock_move m
+  JOIN stock_location src ON m.location_id = src.id
+  JOIN stock_location dest ON m.location_dest_id = dest.id
+  JOIN product_product pp ON m.product_id = pp.id
+  LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  CROSS JOIN params p
+  WHERE ( (src.complete_name  ILIKE '%CBD/Stock%'
+           AND dest.complete_name ILIKE '%KTDA/Stock%')
+       OR (src.complete_name  ILIKE '%KTDA/Stock%'
+           AND dest.complete_name ILIKE '%CBD/Stock%') )
+    AND src.id != dest.id
+    AND COALESCE(pt."name",'') NOT LIKE '%+%'
+    AND DATE(m."date") BETWEEN p.start_date AND p.end_date
+    AND m.state != 'cancel'
+),
+
+-- STREAM 5 — SALES-ORDER DISPATCH (Bagware Tanzania / Luggageware Uganda)
+-- SINZA / UGANDA — pooled from three sources, then deduped WITHOUT the date,
+-- since the same consignment is recorded as a stock move, a transit dispatch
+-- and a sale order and rarely carries the same date on all three. Uganda
+-- takes the stock-move leg alone, not the pool: it reconciles exactly against
+-- FINWH/Goods in Transit/UGANDA's own balance, and the pooled dedup key
+-- (bag+destination+quantity, no date) is too blunt for it — two genuine sends
+-- of the same bag and quantity on different days collapsed into one.
+su_finwh AS (
+  SELECT
+    COALESCE(pt."name", pp.id::text) AS bag_name,
+    CASE
+      WHEN dest.complete_name ILIKE '%UGANDA%' OR dest.complete_name ILIKE 'UG/Stock%'
+        THEN 'UGANDA' ELSE 'SINZA'
+    END AS dest_name,
+    m.product_qty AS qty,
+    DATE(m."date") AS move_date,
+    m.id AS dedup_key
+  FROM stock_move m
+  JOIN stock_location src  ON m.location_id = src.id
+  JOIN stock_location dest ON m.location_dest_id = dest.id
+  JOIN product_product pp  ON m.product_id = pp.id
+  LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  CROSS JOIN params p
+  WHERE (UPPER(src."name") IN ('FINWH','FINWH/STOCK') OR src.complete_name ILIKE '%FINWH%')
+    AND src.complete_name NOT ILIKE '%Goods in Transit%'
+    AND ( dest.complete_name ILIKE '%Goods in Transit/DAR-ES-ALAM%'
+       OR dest.complete_name ILIKE '%Goods in Transit/UGANDA%'
+       OR dest.complete_name ILIKE 'DAR/Stock%'
+       OR dest.complete_name ILIKE 'UG/Stock%'
+       OR dest.complete_name ILIKE '%SINZA%'
+       OR dest.complete_name ILIKE '%UGANDA%'
+       OR UPPER(dest."name") IN ('DAR','SINZA','UG','UGANDA','DAR-ES-ALAM') )
+    AND m.state != 'cancel'
+    AND COALESCE(pt."name",'') NOT LIKE '%+%'
+    AND DATE(m."date") BETWEEN p.start_date AND p.end_date
+),
+su_transit AS (
+  SELECT
+    COALESCE(pt."name", pp.id::text) AS bag_name,
+    CASE
+      WHEN s."name" ILIKE '%UGANDA%' OR UPPER(s."name") = 'UG'
+        THEN 'UGANDA' ELSE 'SINZA'
+    END AS dest_name,
+    l.qty_dispatched AS qty,
+    DATE(t.dispatch_date) AS move_date
+  FROM denri_dispatch_transit_line l
+  JOIN denri_dispatch_transit t ON l.transit_id = t.id
+  JOIN denri_dispatch_shop s ON t.shop_id = s.id
+  JOIN product_product pp ON l.product_id = pp.id
+  LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  CROSS JOIN params p
+  WHERE (s."name" ILIKE '%SINZA%' OR s."name" ILIKE '%DAR%'
+      OR s."name" ILIKE '%UGANDA%' OR UPPER(s."name") IN ('UG','DAR','SINZA','UGANDA'))
+    AND t.state != 'cancel'
+    AND COALESCE(pt."name",'') NOT LIKE '%+%'
+    AND DATE(t.dispatch_date) BETWEEN p.start_date AND p.end_date
+),
+su_sales AS (
+  SELECT
+    COALESCE(pt."name", pp.id::text) AS bag_name,
+    CASE WHEN rp."name" ILIKE '%Luggageware Uganda%' THEN 'UGANDA' ELSE 'SINZA' END AS dest_name,
+    sol.product_uom_qty AS qty,
+    DATE(so.date_order) AS move_date
+  FROM sale_order so
+  JOIN sale_order_line sol ON sol.order_id = so.id
+  JOIN res_partner rp ON so.partner_id = rp.id
+  JOIN product_product pp ON sol.product_id = pp.id
+  LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  CROSS JOIN params p
+  WHERE (rp."name" ILIKE '%Bagware Tanzania%' OR rp."name" ILIKE '%Luggageware Uganda%')
+    AND so.state IN ('sale','done')
+    AND COALESCE(pt."name",'') NOT LIKE '%+%'
+    AND DATE(so.date_order) BETWEEN p.start_date AND p.end_date
+    AND COALESCE(sol.product_uom_qty,0) <> 0
+),
+su_pool AS (
+  SELECT bag_name, dest_name, qty, move_date FROM su_finwh
+  UNION ALL SELECT bag_name, dest_name, qty, move_date FROM su_transit
+  UNION ALL SELECT bag_name, dest_name, qty, move_date FROM su_sales
+),
+sinza_dispatch AS (
+  SELECT bag_name, dest_name, qty, MIN(move_date) AS move_date, NULL::int AS dedup_key
+  FROM su_pool
+  WHERE dest_name = 'SINZA'
+  GROUP BY bag_name, dest_name, qty
+),
+sale_dispatch AS (
+  SELECT bag_name, dest_name, qty, move_date, dedup_key
+  FROM su_finwh
+  WHERE dest_name = 'UGANDA'
+  UNION ALL
+  SELECT bag_name, dest_name, qty, move_date, dedup_key
+  FROM sinza_dispatch
+),
+
+-- STREAM 6 — RETURNS OUT OF A TRANSIT NODE. A bag booked into a shop's
+-- Goods-in-Transit node and then sent back to the warehouse or to purchasing
+-- never reached the shop, so it is not dispatched and it is not in transit —
+-- negative quantities, netted off the destination the bag was originally
+-- routed to.
+transit_returns AS (
+  SELECT
+    COALESCE(pt."name", pp.id::text) AS bag_name,
+    CASE UPPER(SPLIT_PART(src.complete_name, '/', 3))
+      WHEN 'CBD STOCKS'    THEN 'KTDA'
+      WHEN 'KTDA SHOP'     THEN 'KTDA'
+      WHEN 'DAR-ES-ALAM'   THEN 'SINZA'
+      WHEN 'WEBSITE STORE' THEN 'WEBSITE'
+      ELSE UPPER(SPLIT_PART(src.complete_name, '/', 3))
+    END AS dest_name,
+    -m.product_qty AS qty,
+    DATE(m."date") AS move_date,
+    m.id AS dedup_key
+  FROM stock_move m
+  JOIN stock_location src  ON m.location_id = src.id
+  JOIN stock_location dest ON m.location_dest_id = dest.id
+  JOIN product_product pp  ON m.product_id = pp.id
+  LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  CROSS JOIN params p
+  WHERE src.complete_name ILIKE 'FINWH/Goods in Transit/%'
+    AND (dest.complete_name ILIKE 'FINWH%' OR dest.complete_name ILIKE 'PURCH%')
+    AND dest.complete_name NOT ILIKE '%Goods in Transit%'
+    AND m.state = 'done'
+    AND COALESCE(pt."name",'') NOT LIKE '%+%'
+    AND DATE(m."date") BETWEEN p.start_date AND p.end_date
+),
+
+all_moves AS (
+  SELECT bag_name, dest_name, qty, move_date, dedup_key FROM finwh_filtered
+  UNION ALL
+  SELECT bag_name, dest_name, qty, move_date, dedup_key FROM transit_filtered
+  UNION ALL
+  SELECT bag_name, dest_name, qty, move_date, dedup_key FROM cbd_filtered
+  UNION ALL
+  SELECT bag_name, dest_name, qty, move_date, dedup_key FROM ktda_internal
+  UNION ALL
+  SELECT bag_name, dest_name, qty, move_date, dedup_key FROM sale_dispatch
+  UNION ALL
+  SELECT bag_name, dest_name, qty, move_date, dedup_key FROM transit_returns
+),
+
+distinct_moves AS (
+  SELECT DISTINCT bag_name, dest_name, qty, move_date, dedup_key
+  FROM all_moves
+),
+
+aggregated_moves AS (
+  SELECT bag_name, dest_name, SUM(qty) AS qty
+  FROM distinct_moves
+  GROUP BY bag_name, dest_name
+),
+
+pivoted_detail AS (
+  SELECT
+    bag_name,
+    SUM(CASE WHEN dest_name = 'STARMALL' THEN qty ELSE 0 END)   AS "STARMALL",
+    SUM(CASE WHEN dest_name = 'MOMBASA' THEN qty ELSE 0 END)    AS "MOMBASA",
+    SUM(CASE WHEN dest_name = 'NAKURU' THEN qty ELSE 0 END)     AS "NAKURU",
+    SUM(CASE WHEN dest_name = 'ELDORET' THEN qty ELSE 0 END)    AS "ELDORET",
+    SUM(CASE WHEN dest_name = 'KISUMU' THEN qty ELSE 0 END)     AS "KISUMU",
+    SUM(CASE WHEN dest_name = 'MERU' THEN qty ELSE 0 END)       AS "MERU",
+    SUM(CASE WHEN dest_name = 'THIKA' THEN qty ELSE 0 END)      AS "THIKA",
+    SUM(CASE WHEN dest_name = 'HAZINA' THEN qty ELSE 0 END)     AS "HAZINA",
+    SUM(CASE WHEN dest_name = 'KITENGELA' THEN qty ELSE 0 END)  AS "KITENGELA",
+    SUM(CASE WHEN dest_name = 'WEBSITE' THEN qty ELSE 0 END)    AS "WEBSITE",
+    SUM(CASE WHEN dest_name = 'NANYUKI' THEN qty ELSE 0 END)    AS "NANYUKI",
+    SUM(CASE WHEN dest_name = 'NYERI' THEN qty ELSE 0 END)    AS "NYERI",
+    SUM(CASE WHEN dest_name = 'KAKAMEGA' THEN qty ELSE 0 END)   AS "KAKAMEGA",
+    SUM(CASE WHEN dest_name = 'HILTON' THEN qty ELSE 0 END)     AS "HILTON",
+    SUM(CASE WHEN dest_name = 'SINZA' THEN qty ELSE 0 END)      AS "SINZA",
+    SUM(CASE WHEN dest_name = 'UGANDA' THEN qty ELSE 0 END)     AS "UGANDA",
+    SUM(CASE WHEN dest_name = 'KISII' THEN qty ELSE 0 END)      AS "KISII",
+    SUM(CASE WHEN dest_name = 'KTDA' THEN qty ELSE 0 END)       AS "KTDA",
+    SUM(CASE WHEN dest_name = 'KTDA NEW' THEN qty ELSE 0 END)   AS "KTDA NEW",
+    SUM(CASE WHEN dest_name = 'BUSIA' THEN qty ELSE 0 END)      AS "BUSIA",
+    SUM(CASE WHEN dest_name = 'RONGAI' THEN qty ELSE 0 END)     AS "RONGAI"
+  FROM aggregated_moves
+  GROUP BY bag_name
+),
+
+family_map AS (
+  SELECT DISTINCT bag_name, SPLIT_PART(bag_name, ' ', 1) AS family
+  FROM pivoted_detail
+),
+family_subtotals AS (
+  SELECT
+    f.family || ' TOTAL' AS bag_name,
+    SUM(p."STARMALL")   AS "STARMALL",
+    SUM(p."MOMBASA")    AS "MOMBASA",
+    SUM(p."NAKURU")     AS "NAKURU",
+    SUM(p."ELDORET")    AS "ELDORET",
+    SUM(p."KISUMU")     AS "KISUMU",
+    SUM(p."MERU")       AS "MERU",
+    SUM(p."THIKA")      AS "THIKA",
+    SUM(p."HAZINA")     AS "HAZINA",
+    SUM(p."KITENGELA")  AS "KITENGELA",
+    SUM(p."WEBSITE")    AS "WEBSITE",
+    SUM(p."NANYUKI")    AS "NANYUKI",
+    SUM(p."NYERI")    AS "NYERI",
+    SUM(p."KAKAMEGA")   AS "KAKAMEGA",
+    SUM(p."HILTON")     AS "HILTON",
+    SUM(p."SINZA")      AS "SINZA",
+    SUM(p."UGANDA")     AS "UGANDA",
+    SUM(p."KISII")      AS "KISII",
+    SUM(p."KTDA")       AS "KTDA",
+    SUM(p."KTDA NEW")   AS "KTDA NEW",
+    SUM(p."BUSIA")      AS "BUSIA",
+    SUM(p."RONGAI")     AS "RONGAI"
+  FROM pivoted_detail p
+  JOIN family_map f ON p.bag_name = f.bag_name
+  GROUP BY f.family
+),
+grand_total AS (
+  SELECT
+    'GRAND TOTAL' AS bag_name,
+    SUM("STARMALL")   AS "STARMALL",
+    SUM("MOMBASA")    AS "MOMBASA",
+    SUM("NAKURU")     AS "NAKURU",
+    SUM("ELDORET")    AS "ELDORET",
+    SUM("KISUMU")     AS "KISUMU",
+    SUM("MERU")       AS "MERU",
+    SUM("THIKA")      AS "THIKA",
+    SUM("HAZINA")     AS "HAZINA",
+    SUM("KITENGELA")  AS "KITENGELA",
+    SUM("WEBSITE")    AS "WEBSITE",
+    SUM("NANYUKI")    AS "NANYUKI",
+    SUM("NYERI")    AS "NYERI",
+    SUM("KAKAMEGA")   AS "KAKAMEGA",
+    SUM("HILTON")     AS "HILTON",
+    SUM("SINZA")      AS "SINZA",
+    SUM("UGANDA")     AS "UGANDA",
+    SUM("KISII")      AS "KISII",
+    SUM("KTDA")       AS "KTDA",
+    SUM("KTDA NEW")   AS "KTDA NEW",
+    SUM("BUSIA")      AS "BUSIA",
+    SUM("RONGAI")     AS "RONGAI"
+  FROM pivoted_detail
+),
+combined AS (
+  SELECT
+    bag_name,
+    "STARMALL","MOMBASA","NAKURU","ELDORET","KISUMU","MERU","THIKA","HAZINA",
+    "KITENGELA","WEBSITE","NANYUKI","NYERI","KAKAMEGA","HILTON","SINZA","UGANDA",
+    "KISII","KTDA","KTDA NEW","BUSIA","RONGAI",
+    SPLIT_PART(bag_name, ' ', 1) AS family,
+    0 AS sort_order
+  FROM pivoted_detail
+  UNION ALL
+  SELECT
+    bag_name,
+    "STARMALL","MOMBASA","NAKURU","ELDORET","KISUMU","MERU","THIKA","HAZINA",
+    "KITENGELA","WEBSITE","NANYUKI","NYERI","KAKAMEGA","HILTON","SINZA","UGANDA",
+    "KISII","KTDA","KTDA NEW","BUSIA","RONGAI",
+    bag_name AS family,
+    1 AS sort_order
+  FROM family_subtotals
+  UNION ALL
+  SELECT
+    bag_name,
+    "STARMALL","MOMBASA","NAKURU","ELDORET","KISUMU","MERU","THIKA","HAZINA",
+    "KITENGELA","WEBSITE","NANYUKI","NYERI","KAKAMEGA","HILTON","SINZA","UGANDA",
+    "KISII","KTDA","KTDA NEW","BUSIA","RONGAI",
+    '~~~~' AS family,
+    2 AS sort_order
+  FROM grand_total
+)
+
+SELECT
+  bag_name AS "Product",
+  "STARMALL","MOMBASA","NAKURU","ELDORET","KISUMU","MERU","THIKA","HAZINA",
+  "KITENGELA","WEBSITE","NANYUKI","NYERI","KAKAMEGA","HILTON","SINZA","UGANDA",
+  "KISII","KTDA","KTDA NEW","BUSIA","RONGAI",
+  ("STARMALL"+"MOMBASA"+"NAKURU"+"ELDORET"+"KISUMU"+"MERU"+"THIKA"+"HAZINA"+
+   "KITENGELA"+"WEBSITE"+"NANYUKI"+"NYERI"+"KAKAMEGA"+"HILTON"+"SINZA"+"UGANDA"+
+   "KISII"+"KTDA"+"KTDA NEW"+"BUSIA"+"RONGAI") AS "TOTAL",
+  family AS "Family",
+  sort_order
+FROM combined
+ORDER BY family, sort_order, bag_name;
+"""
+
+# The transit balance, straight from Odoo: a QUANT BALANCE out of
+# FINWH/Goods in Transit/*, not dispatched-minus-received over a window. A
+# flow reading (two date-ranged reports subtracted) gave Sinza 322 over a
+# week, 267 over a month and -843 over a year against a true balance of 322 —
+# a window only ever sees the transactions inside it, not the running balance
+# they left behind. No date params: "what is in transit" is a question about
+# now, and this deliberately does not follow the page's date range.
+TRANSIT_BALANCE = """
+WITH quant_balance AS (
+  SELECT
+    COALESCE(pt."name", pp.id::text) AS bag_name,
+    sl.complete_name AS location_path,
+    sq.quantity AS qty
+  FROM stock_quant sq
+  JOIN stock_location sl ON sl.id = sq.location_id
+  JOIN product_product pp ON pp.id = sq.product_id
+  LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id
+  WHERE sl.complete_name ILIKE 'FINWH/Goods in Transit/%'
+    AND sq.quantity <> 0
+    AND COALESCE(pt."name",'') NOT LIKE '%+%'
+),
+code_mapping AS (
+  SELECT 'STAR' AS code, 'STARMALL' AS full_name
+  UNION ALL SELECT 'MSA', 'MOMBASA'
+  UNION ALL SELECT 'NAKS', 'NAKURU'
+  UNION ALL SELECT 'ELD', 'ELDORET'
+  UNION ALL SELECT 'KSM', 'KISUMU'
+  UNION ALL SELECT 'MERU', 'MERU'
+  UNION ALL SELECT 'THK', 'THIKA'
+  UNION ALL SELECT 'HAZ', 'HAZINA'
+  UNION ALL SELECT 'KITE', 'KITENGELA'
+  UNION ALL SELECT 'WEB', 'WEBSITE'
+  UNION ALL SELECT 'WEBSITE', 'WEBSITE'
+  UNION ALL SELECT 'NAN', 'NANYUKI'
+  UNION ALL SELECT 'NYERI', 'NYERI'
+  UNION ALL SELECT 'KAK', 'KAKAMEGA'
+  UNION ALL SELECT 'HTN', 'HILTON'
+  UNION ALL SELECT 'DAR-ES-ALAM', 'SINZA'
+  UNION ALL SELECT 'DAR', 'SINZA'
+  UNION ALL SELECT 'UGANDA', 'UGANDA'
+  UNION ALL SELECT 'UG', 'UGANDA'
+  UNION ALL SELECT 'KSI', 'KISII'
+  UNION ALL SELECT 'KTDA', 'KTDA'
+  UNION ALL SELECT 'KTDA NEW', 'KTDA NEW'
+  UNION ALL SELECT 'BUSIA', 'BUSIA'
+  UNION ALL SELECT 'RONG', 'RONGAI'
+  UNION ALL SELECT 'RONGAI', 'RONGAI'
+  UNION ALL SELECT 'MRKT', 'MRKT'
+  UNION ALL SELECT 'MARKET', 'MRKT'
+  UNION ALL SELECT 'CORP', 'CORPORATE'
+  UNION ALL SELECT 'CORPORATE', 'CORPORATE'
+  UNION ALL SELECT 'COMPLIMENTARY', 'COMPLIMENTARY'
+  UNION ALL SELECT 'CBD', 'CBD'
+  -- The transit node's own name is a two-word compound, not the short code
+  -- the other rows key off — "CBD Stocks" and "KTDA Shop" verified live.
+  UNION ALL SELECT 'CBD STOCKS', 'CBD'
+  UNION ALL SELECT 'KTDA SHOP', 'KTDA'
+  UNION ALL SELECT 'WEBSITE STORE', 'WEBSITE'
+),
+mapped AS (
+  SELECT
+    qb.bag_name,
+    -- Falls back to the raw path segment (unmapped) rather than dropping the
+    -- row, so a new transit node still surfaces in the total and in
+    -- transit.unmapped_destinations() instead of silently vanishing.
+    COALESCE(cm.full_name, UPPER(SPLIT_PART(qb.location_path, '/', 3))) AS dest_name,
+    qb.qty
+  FROM quant_balance qb
+  LEFT JOIN code_mapping cm ON UPPER(SPLIT_PART(qb.location_path, '/', 3)) = cm.code
+)
+SELECT
+  bag_name AS "Product",
+  dest_name AS "Destination",
+  SUM(qty) AS "Quantity"
+FROM mapped
+GROUP BY bag_name, dest_name
+HAVING SUM(qty) <> 0;
+"""
+
+# Raw dispatch and receipt events behind Shops Receiving — one row per move,
+# not yet settled against each other. lib/views.py's FIFO settlement (see
+# _settle_receiving) matches these two streams per shop+bag: oldest dispatch
+# against oldest receipt, first, so a split delivery (part of a consignment
+# landing before the rest) still counts each bag once rather than leaving the
+# whole line "outstanding" until every last bag of it has arrived.
+SHOPS_RECEIVING_DISPATCHES = """
+WITH params AS (
+  SELECT
+    CAST(:start_date AS DATE) AS start_date,
+    CAST(:end_date AS DATE) AS end_date
+),
+moves AS MATERIALIZED (
+  SELECT
+    m.state, m.product_qty AS qty, DATE(m."date") AS move_date,
+    EXTRACT(DOW FROM m."date") = 0 AS is_sunday,
+    src.complete_name AS src_path, dest.complete_name AS dest_path,
+    COALESCE(pt."name", pp.id::text) AS bag_name
+  FROM stock_move m
+  JOIN stock_location src  ON m.location_id = src.id
+  JOIN stock_location dest ON m.location_dest_id = dest.id
+  JOIN product_product pp  ON m.product_id = pp.id
+  LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  CROSS JOIN params p
+  WHERE DATE(m."date") BETWEEN p.start_date AND p.end_date
+    AND COALESCE(pt."name",'') NOT LIKE '%+%'
+),
+dispatches AS (
+  SELECT
+    bag_name,
+    CASE
+      WHEN dest_path ILIKE '%MSA%'    THEN 'MOMBASA'
+      WHEN dest_path ILIKE '%NAKS%'   THEN 'NAKURU'
+      WHEN dest_path ILIKE '%ELD%'    THEN 'ELDORET'
+      WHEN dest_path ILIKE '%KSM%'    THEN 'KISUMU'
+      WHEN dest_path ILIKE '%MERU%'   THEN 'MERU'
+      WHEN dest_path ILIKE '%THK%'    THEN 'THIKA'
+      WHEN dest_path ILIKE '%HAZ%'    THEN 'HAZINA'
+      WHEN dest_path ILIKE '%KITE%'   THEN 'KITENGELA'
+      WHEN dest_path ILIKE '%NAN%'    THEN 'NANYUKI'
+      WHEN dest_path ILIKE '%NYERI%'    THEN 'NYERI'
+      WHEN dest_path ILIKE '%KAK%'    THEN 'KAKAMEGA'
+      WHEN dest_path ILIKE '%HTN%'    THEN 'HILTON'
+      WHEN dest_path ILIKE '%KSI%'    THEN 'KISII'
+      WHEN dest_path ILIKE '%BUSIA%'  THEN 'BUSIA'
+      WHEN dest_path ILIKE '%RONG%'   THEN 'RONGAI'
+      WHEN dest_path ILIKE '%STAR%'   THEN 'STARMALL'
+      WHEN dest_path ILIKE '%CBD%'    THEN 'KTDA'
+      ELSE NULL
+    END AS shop,
+    qty, move_date
+  FROM moves
+  WHERE src_path ILIKE 'FINWH%'
+    AND src_path NOT ILIKE '%Goods in Transit%'
+    AND dest_path ILIKE '%Goods in Transit%'
+    AND state != 'cancel'
+    AND NOT is_sunday
+)
+SELECT bag_name AS "Product", shop AS "Shop", move_date AS "Date", qty AS "Qty"
+FROM dispatches
+WHERE shop IS NOT NULL AND qty > 0
+ORDER BY "Product", "Shop", "Date";
+"""
+
+SHOPS_RECEIVING_RECEIPTS = """
+WITH params AS (
+  SELECT
+    CAST(:start_date AS DATE) AS start_date,
+    CAST(:end_date AS DATE) AS end_date
+),
+moves AS MATERIALIZED (
+  SELECT
+    m.state, m.product_qty AS qty, DATE(m."date") AS move_date,
+    src.complete_name AS src_path, dest.complete_name AS dest_path,
+    COALESCE(pt."name", pp.id::text) AS bag_name
+  FROM stock_move m
+  JOIN stock_location src  ON m.location_id = src.id
+  JOIN stock_location dest ON m.location_dest_id = dest.id
+  JOIN product_product pp  ON m.product_id = pp.id
+  LEFT JOIN product_template pt ON pp.product_tmpl_id = pt.id
+  -- A wide net on purpose: a receipt can land any time after its dispatch,
+  -- not just inside the same date range, so this looks a month past the
+  -- window's end to catch late arrivals the settlement step can still match.
+  CROSS JOIN params p
+  WHERE DATE(m."date") BETWEEN p.start_date AND (p.end_date + INTERVAL '30 days')
+    AND COALESCE(pt."name",'') NOT LIKE '%+%'
+),
+receipts AS (
+  SELECT
+    bag_name,
+    CASE
+      WHEN dest_path ILIKE '%MSA/Stock%'    THEN 'MOMBASA'
+      WHEN dest_path ILIKE '%NAKS/Stock%'   THEN 'NAKURU'
+      WHEN dest_path ILIKE '%ELD/Stock%'    THEN 'ELDORET'
+      WHEN dest_path ILIKE '%KSM/Stock%'    THEN 'KISUMU'
+      WHEN dest_path ILIKE '%MERU/Stock%'   THEN 'MERU'
+      WHEN dest_path ILIKE '%THK/Stock%'    THEN 'THIKA'
+      WHEN dest_path ILIKE '%HAZ/Stock%'    THEN 'HAZINA'
+      WHEN dest_path ILIKE '%KITE/Stock%'   THEN 'KITENGELA'
+      WHEN dest_path ILIKE '%NAN/Stock%'    THEN 'NANYUKI'
+      WHEN dest_path ILIKE '%NYERI/Stock%'    THEN 'NYERI'
+      WHEN dest_path ILIKE '%KAK/Stock%'    THEN 'KAKAMEGA'
+      WHEN dest_path ILIKE '%HTN/Stock%'    THEN 'HILTON'
+      WHEN dest_path ILIKE '%KSI/Stock%'    THEN 'KISII'
+      WHEN dest_path ILIKE '%BUSIA/Stock%'  THEN 'BUSIA'
+      WHEN dest_path ILIKE '%RONG/Stock%'   THEN 'RONGAI'
+      WHEN dest_path ILIKE '%STAR/Stock%'   THEN 'STARMALL'
+      WHEN dest_path ILIKE '%CBD/Stock%'    THEN 'KTDA'
+      ELSE NULL
+    END AS shop,
+    qty, move_date
+  FROM moves
+  WHERE src_path ILIKE 'FINWH/Goods in Transit/%'
+    AND state = 'done'
+)
+SELECT bag_name AS "Product", shop AS "Shop", move_date AS "Date", qty AS "Qty"
+FROM receipts
+WHERE shop IS NOT NULL AND qty > 0
+ORDER BY "Product", "Shop", "Date";
+"""
+
+# One row per sold line: Date, parsed Product + Color, Location, unit Price,
+# Quantity, Total. A lighter version of CUSTOMER_SALES without the customer
+# name-cleaning/gender lookups — built for offer-type classification
+# (lib/deals.py), which only needs product/location/price/date.
+PRODUCT_LINE_ITEMS = """
+WITH color_list(color) AS (
+    VALUES
+        -- Multi-word colors (longest match wins)
+        ('Black TT'),('Grey TT'),('Beige TT'),('Green TT'),
+        ('Wooven Black'),('Wooven Maroon'),('Wooven Mustard'),('Wooven Purple'),
+        ('Wooven Cream'),('Wooven Brown'),('Wooven Lilac'),
+        ('Croc Black'),('Croc Brown'),('Croc Mustard'),('Croc Orange'),('Croc Pink'),
+        ('Dark Brown'),('Mint Green'),('Yellow Brown'),('Yellow Dotted'),('Navy Blue'),
+        ('Antelope Brown'),
+        ('Red.Pattern'),('Red Pattern'),
+        ('Pattern Pink'),('Pattern Blue'),('Pattern Red'),
+        ('Amapiano Black'),('Amapiano Brown'),('Amapiano Grey'),('Amapiano Nude'),
+        ('Ankara Black'),('Ankara Brown'),('Ankara Grey'),('Ankara Nude'),
+        ('Black X Red'),
+        ('Beige/Red'),('Black/Cracked'),('Black/Red'),('Green/Red'),('Maroon/Red'),
+        ('Black/Beige'),('Black/Choco'),('Black/D.Brown'),('Black/Grey'),('Black/Spice'),
+        ('Red/Black'),('Grey/Black'),('Spice/Black'),('Cracked/Black'),('Chocolate/Black'),
+        ('Black 018'),('Beige 018'),('Dark Brown 018'),('Maroon 018'),
+        ('Titan 1'),('Titan 3'),('Titan 5'),('Titan 6'),('Titan 11'),('Titan 14'),('Titan 15'),
+        ('Goyard 5'),
+        ('Start 20'),('Start 4'),('Start 8'),
+        ('Red P'),('Black B'),('N.Blue'),('D.Brown'),
+        ('Manyatta Dark Brown'),('Manyatta Dark Green'),('Manyatta Green'),('Manyatta Yellow'),
+        ('CN Black'),('CN Grey'),('CN Dark Brown'),
+        ('A3 Red'),('A3 Pink'),
+        ('A4 Red'),('A4 Pink'),
+        ('A5 Red'),('A5 Pink'),
+        ('A3'),('A4'),('A5'),
+        ('Denim Blue'),('Wine Red'),('Crimson'),
+        ('Beige'),('Black'),('Blue'),('Brown'),('Chocolate'),('Choco'),
+        ('Cracked'),('Green'),('green'),('GREEN'),('Grey'),('Gold'),('Lilac'),('Maroon'),
+        ('Mustard'),('Nude'),('Orange'),('Pink'),('Purple'),
+        ('Red'),('Spice'),('White'),('Yellow')
+),
+
+product_color_split AS (
+    SELECT
+        pt.id AS product_tmpl_id,
+        pt.name AS full_name,
+        (
+            SELECT cl.color
+            FROM color_list cl
+            WHERE pt.name LIKE '% ' || cl.color
+               OR pt.name = cl.color
+            ORDER BY LENGTH(cl.color) DESC
+            LIMIT 1
+        ) AS matched_color
+    FROM product_template pt
+),
+
+-- What was refunded against each sale line. Every refund line in Odoo points
+-- at the line it reverses, and every September 2026 refund was rung the same
+-- day as its sale, so folding it into that sale nets the day exactly as the
+-- daily Bags Sold report does, without leaving a negative row behind.
+refunded AS (
+    SELECT
+        r.refunded_orderline_id     AS line_id,
+        SUM(r.qty)                  AS qty,
+        SUM(r.price_subtotal_incl)  AS amount
+    FROM pos_order_line r
+    WHERE r.refunded_orderline_id IS NOT NULL
+    GROUP BY r.refunded_orderline_id
+)
+
+SELECT
+    po.date_order::DATE                                             AS "Date",
+
+    CASE
+        WHEN pcs.matched_color IS NULL
+            THEN TRIM(REGEXP_REPLACE(pcs.full_name, '^\\d+(\\.\\d+)?\\s*KES\\s+discount.*$', '', 'i'))
+        WHEN pcs.full_name = pcs.matched_color
+            THEN pcs.full_name
+        ELSE TRIM(REGEXP_REPLACE(
+                LEFT(
+                    pcs.full_name,
+                    LENGTH(pcs.full_name) - LENGTH(pcs.matched_color)
+                ),
+                '^\\d+(\\.\\d+)?\\s*KES\\s+discount.*$', '', 'i'
+            ))
+    END                                                             AS "Product",
+
+    CASE
+        WHEN pcs.matched_color IS NULL THEN 'Combo'
+        ELSE pcs.matched_color
+    END                                                             AS "Color",
+
+    CASE
+        -- The staff till sells out of the Accessories & Materials Store
+        -- location, so it is named by its till, not its stock location.
+        WHEN lower(pconf.name) = 'staff pos'
+            THEN 'Staff POS'
+        WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%'
+            THEN 'Sinza'
+        ELSE INITCAP(
+                TRIM(REGEXP_REPLACE(
+                    COALESCE(sw.name, sl.complete_name, 'N/A'),
+                    '\\s*Shop\\s*', '', 'gi'
+                ))
+            )
+    END                                                             AS "Location",
+
+    ROUND(
+        (pol.price_subtotal_incl / COALESCE(NULLIF(po.currency_rate, 0), 1))
+            / NULLIF(pol.qty, 0),
+        2
+    )                                                               AS "Price",
+
+    -- Bags only, net of whatever was refunded against the line. A strap, an
+    -- order-level discount or a combo container is not a bag, so it carries
+    -- no quantity — but its row stays, because its money is part of the
+    -- takings.
+    CASE
+        WHEN (COALESCE(pc.name, '') ILIKE 'Bags%' OR pt.name ILIKE '%Gift Bag%')
+         AND COALESCE(pol.is_combo_line, FALSE) = FALSE
+         AND COALESCE(pt.is_combo, FALSE) = FALSE
+        THEN pol.qty + COALESCE(ref.qty, 0) ELSE 0
+    END                                                             AS "Quantity",
+
+    -- Odoo writes a combo as a container line holding the whole price plus a
+    -- zero-priced line per bag inside it. Both are kept: the container is
+    -- where the money is, the inner lines are the bags. Which is which is
+    -- flagged here so nothing counts a combo twice.
+    (COALESCE(pol.is_combo_line, FALSE)
+        OR COALESCE(pt.is_combo, FALSE))                            AS "Bundle",
+    COALESCE(pol.sub_product_line, FALSE)                           AS "In Bundle",
+    -- Combos sold on a bundle's container line, net of refunds (0 elsewhere).
+    CASE
+        WHEN COALESCE(pol.is_combo_line, FALSE) OR COALESCE(pt.is_combo, FALSE)
+        THEN pol.qty + COALESCE(ref.qty, 0) ELSE 0
+    END                                                             AS "Bundles",
+
+    ROUND(
+        (pol.price_subtotal_incl + COALESCE(ref.amount, 0))
+            / COALESCE(NULLIF(po.currency_rate, 0), 1),
+        2
+    )                                                               AS "Total"
+
+FROM pos_order po
+
+LEFT JOIN pos_order_line       pol   ON pol.order_id = po.id
+LEFT JOIN refunded             ref   ON ref.line_id = pol.id
+LEFT JOIN product_product      pp    ON pp.id    = pol.product_id
+LEFT JOIN product_template     pt    ON pt.id    = pp.product_tmpl_id
+LEFT JOIN product_color_split  pcs   ON pcs.product_tmpl_id = pt.id
+LEFT JOIN product_category     pc    ON pc.id    = pt.categ_id
+LEFT JOIN pos_session          ps    ON ps.id    = po.session_id
+LEFT JOIN pos_config           pconf ON pconf.id = ps.config_id
+LEFT JOIN stock_picking_type   spt   ON spt.id   = pconf.picking_type_id
+LEFT JOIN stock_warehouse      sw    ON sw.id    = spt.warehouse_id
+LEFT JOIN stock_location       sl    ON sl.id    = spt.default_location_src_id
+
+WHERE
+    po.state IN ('done', 'paid', 'invoiced')
+    AND pt.name NOT ILIKE '%Delivery Fee%'
+    AND pc.name NOT ILIKE '%Pos%'
+    -- Refund lines are folded into the sale they reverse (see "refunded"),
+    -- so they are not listed themselves, and a sale refunded in full drops
+    -- out with its refund — Eldoret keyed 777 Lola Black on 7 Sep 2026 and
+    -- reversed 776 an hour later; that nets to the one bag actually sold.
+    AND pol.qty > 0
+    AND NOT (pol.qty + COALESCE(ref.qty, 0) = 0
+             AND pol.price_subtotal_incl + COALESCE(ref.amount, 0) = 0)
+    -- Order-level discount lines stay: they are money off the takings, so
+    -- dropping them left this tab's revenue above the Sales page's. They
+    -- carry no quantity, being a discount rather than a bag.
+    AND (COALESCE(sw.name, sl.complete_name) NOT ILIKE '%Accessories%'  -- shop locations only, not production
+         OR lower(pconf.name) = 'staff pos')
+    AND COALESCE(sw.name, sl.complete_name) NOT ILIKE '%Flash Sale%'
+    AND po.date_order >= CAST(:start_date AS TIMESTAMP)
+    AND po.date_order < CAST(:end_date AS TIMESTAMP) + INTERVAL '1 day'
+
+ORDER BY po.date_order DESC;
+"""
+
+# The new collections being tracked, named in lib/data/new_products.csv and
+# passed in as :families. The list is the business's call rather than a rule:
+# deciding "new" from a product's age dropped Voyage (first sold Nov 2025),
+# Loop BP, Amora and Imani, which the team still tracks as launches, and a
+# 30-unit bar kept Lafemme out until it had sold 30.
+#
+# A family covers every template named the family itself or the family
+# followed by more words — "Loop BP" takes in Loop BP CN Black, Loop BP 018
+# Black and reject stock alike — limited to the Bags categories so "Taji"
+# does not also catch the TAJIRI and TAJI JUMBO items filed under "All".
+# Bags are counted as the bags-sold figures count them (combo containers out,
+# a refunded bag counted as a movement); revenue nets refunds.
+NEW_PRODUCTS = """
+WITH tracked AS (
+    SELECT DISTINCT TRIM(f) AS family
+    FROM UNNEST(CAST(:families AS TEXT[])) AS f
+    WHERE TRIM(f) <> ''
+),
+
+lines AS (
+    SELECT
+        t.family,
+        po.date_order::DATE                                          AS sale_date,
+        pol.qty                                                      AS qty,
+        pol.price_subtotal_incl / COALESCE(NULLIF(po.currency_rate, 0), 1) AS total,
+        pol.qty > 0                                                  AS is_sale
+    FROM pos_order po
+    JOIN pos_order_line   pol ON pol.order_id = po.id
+    JOIN product_product  pp  ON pp.id = pol.product_id
+    JOIN product_template pt  ON pt.id = pp.product_tmpl_id
+    JOIN product_category pc  ON pc.id = pt.categ_id
+    JOIN tracked t
+      ON LOWER(pt.name) = LOWER(t.family)
+      OR LOWER(pt.name) LIKE LOWER(t.family) || ' %'
+    WHERE po.state IN ('done', 'paid', 'invoiced')
+      AND pol.qty <> 0
+      AND pc.name ILIKE 'Bags%'
+      AND COALESCE(pol.is_combo_line, FALSE) = FALSE
+      AND COALESCE(pt.is_combo, FALSE) = FALSE
+      AND pt.name NOT LIKE '%+%'
+)
+
+SELECT
+    t.family                                                         AS "Product",
+    MIN(l.sale_date) FILTER (WHERE l.is_sale)                        AS "First Sold",
+    COALESCE(SUM(l.qty) FILTER (
+        WHERE l.sale_date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)), 0)
+                                                                     AS "Quantity Sold",
+    ROUND(COALESCE(SUM(l.total) FILTER (
+        WHERE l.sale_date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)), 0)::NUMERIC, 2)
+                                                                     AS "Revenue",
+    COALESCE(SUM(l.qty), 0)                                          AS "Units Since Launch"
+FROM tracked t
+LEFT JOIN lines l ON l.family = t.family
+GROUP BY t.family
+ORDER BY "Revenue" DESC, t.family
+"""
+
+
+# What each bag normally sells for at each shop — the modal unit price over the
+# 90 days ending at the report's end_date.
+#
+# Deliberately observed rather than referenced. product_template.list_price
+# reproduces Kenya's shelf price well (75-85% of Kenya lines land exactly on
+# it), but is meaningless for Sinza and Uganda, which price from their own
+# TANZANIA/UGANDA pricelists in TZS/UGX — and those rule prices no longer
+# match what those shops actually charge (Jumbo Black rules at ~3,700 KES
+# equivalent against 2,000 actually taken). An observed modal needs no
+# reference data, works the same in every currency, and cannot go stale.
+#
+# The window is anchored on end_date and fixed at 90 days so the baseline does
+# not move with the selected range: picking "Today" would otherwise make each
+# day its own baseline and no sale could ever look discounted.
+#
+# Conservative by construction: a bag sold on promotion more often than not
+# has the promotion price as its mode, so its discount goes unreported. It
+# under-counts rather than inventing discounts that were not given.
+USUAL_PRICES = """
+WITH window_lines AS (
+  SELECT
+    CASE
+      WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%' THEN 'Sinza'
+      ELSE INITCAP(TRIM(REGEXP_REPLACE(
+             COALESCE(sw.name, sl.complete_name, 'N/A'), '\s*Shop\s*', '', 'gi')))
+    END AS location,
+    COALESCE(pt."name", '<<unknown>>') AS full_name,
+    ROUND(pol.price_subtotal_incl / NULLIF(pol.qty, 0)
+          / COALESCE(NULLIF(po.currency_rate, 0), 1)) AS unit_price
+  FROM pos_order po
+  JOIN pos_order_line pol ON pol.order_id = po.id
+  LEFT JOIN product_product pp ON pp.id = pol.product_id
+  LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id
+  LEFT JOIN product_category pc ON pc.id = pt.categ_id
+  LEFT JOIN pos_session ps ON ps.id = po.session_id
+  LEFT JOIN pos_config pconf ON pconf.id = ps.config_id
+  LEFT JOIN stock_picking_type spt ON spt.id = pconf.picking_type_id
+  LEFT JOIN stock_warehouse sw ON sw.id = spt.warehouse_id
+  LEFT JOIN stock_location sl ON sl.id = spt.default_location_src_id
+  WHERE po.date_order::DATE
+        BETWEEN CAST(:end_date AS DATE) - INTERVAL '90 days' AND CAST(:end_date AS DATE)
+    AND po.state IN ('done', 'paid')
+    AND pol.qty > 0
+    AND pol.price_subtotal_incl > 0
+    AND COALESCE(pt."name", '') NOT LIKE '%+%'
+    AND COALESCE(pt."name", '') NOT ILIKE '%Delivery Fee%'
+    AND COALESCE(pt."name", '') NOT ILIKE '%Gift Bag%'
+    AND COALESCE(pt."name", '') NOT ILIKE '%KES discount%'
+    AND COALESCE(pc."name", '') NOT ILIKE '%Pos%'
+)
+SELECT
+  location                                              AS "Location",
+  full_name                                             AS "Full Name",
+  MODE() WITHIN GROUP (ORDER BY unit_price)             AS "Usual Price",
+  COUNT(*)                                              AS "Observations"
+FROM window_lines
+GROUP BY location, full_name
+HAVING COUNT(*) >= 3;   -- too few sales to call any price "usual"
+"""
+
+
+# Dated pricelist rules — the promotions as Odoo itself holds them, with the
+# shops each pricelist serves.
+#
+# Read straight from Odoo rather than from a spreadsheet: where a dated rule
+# exists the till charged that price 96.4% of the time, against manual shops
+# where a week's sample had 77 bags sold at full price despite being on the
+# list. The rule is what the customer was actually charged.
+#
+# Includes inactive rules on purpose. A retired rule still describes what was
+# on offer while it ran, and 47 of the May rules are already deactivated —
+# filtering on active would erase the history this exists to keep.
+PRICELIST_RULES = """
+SELECT
+  pl.name                                   AS "Pricelist",
+  pt."name"                                 AS "Product",
+  i.fixed_price                             AS "Rule Price",
+  i.compute_price                           AS "Compute",
+  i.percent_price                           AS "Percent",
+  cur.name                                  AS "Currency",
+  i.date_start::DATE                        AS "Starts",
+  i.date_end::DATE                          AS "Ends",
+  i.active                                  AS "Active",
+  i.write_date                              AS "Last Changed",
+  (SELECT STRING_AGG(DISTINCT pc."name", ', ' ORDER BY pc."name")
+     FROM pos_config pc WHERE pc.pricelist_id = pl.id) AS "Tills"
+FROM product_pricelist_item i
+JOIN product_pricelist pl ON pl.id = i.pricelist_id
+LEFT JOIN product_template pt ON pt.id = i.product_tmpl_id
+LEFT JOIN res_currency cur ON cur.id = i.currency_id
+WHERE i.date_start IS NOT NULL
+  AND pt."name" IS NOT NULL
+ORDER BY i.date_start DESC, pl.name, pt."name";
+"""
+
+# Order-level promotions that ride as their own line: "300.0 KES discount on
+# total amount", the percentage variants, and anything like them. They carry a
+# negative amount and are not a product, so every other query excludes them by
+# name — which left a promotion that has run since April 2026, worth -KES
+# 197,700 so far, invisible on a page whose whole job is reporting offers.
+ORDER_DISCOUNTS = """
+SELECT
+  po.date_order::DATE AS "Date",
+  CASE
+    WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%' THEN 'Sinza'
+    ELSE INITCAP(TRIM(REGEXP_REPLACE(
+           COALESCE(sw.name, sl.complete_name, 'N/A'), '\s*Shop\s*', '', 'gi')))
+  END                 AS "Location",
+  pt."name"           AS "Offer",
+  COUNT(*)            AS "Times Given",
+  ROUND(SUM(pol.price_subtotal_incl
+            / COALESCE(NULLIF(po.currency_rate, 0), 1)), 2) AS "Value"
+FROM pos_order po
+JOIN pos_order_line pol ON pol.order_id = po.id
+JOIN product_product pp ON pp.id = pol.product_id
+JOIN product_template pt ON pt.id = pp.product_tmpl_id
+LEFT JOIN pos_session ps ON ps.id = po.session_id
+LEFT JOIN pos_config pconf ON pconf.id = ps.config_id
+LEFT JOIN stock_picking_type spt ON spt.id = pconf.picking_type_id
+LEFT JOIN stock_warehouse sw ON sw.id = spt.warehouse_id
+LEFT JOIN stock_location sl ON sl.id = spt.default_location_src_id
+WHERE po.date_order >= CAST(:start_date AS TIMESTAMP)
+        AND po.date_order < CAST(:end_date AS TIMESTAMP) + INTERVAL '1 day'
+  AND po.state IN ('done', 'paid')
+  AND (pt."name" ILIKE '%discount%' OR pt."name" ILIKE '%promo%')
+GROUP BY 1, 2, 3
+ORDER BY "Date" DESC, "Value";
+"""
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp Monitor and Social DMs (the denri_monitor / denri_leads modules).
+#
+# Selection fields are stored as keys ('not_purchased'); the labels below are
+# the ones Odoo shows, read from ir_model_fields_selection so the dashboard
+# says what the app says.
+# ---------------------------------------------------------------------------
+
+# The tables these pages read. reporting_reader was not granted them when the
+# modules were installed, so the page checks before querying and names the
+# missing grant rather than failing on "permission denied".
+ENGAGEMENT_TABLES = [
+    "denri_monitor_interaction", "denri_monitor_shop", "denri_monitor_source",
+    "denri_monitor_reason", "denri_monitor_bag", "denri_monitor_transfer_reason",
+    "denri_monitor_interaction_oos_product_rel", "denri_monitor_followup",
+    "denri_social_dm", "denri_social_channel", "denri_social_shop_outcome",
+    "denri_lead", "denri_lead_branch", "denri_lead_style", "denri_lead_colour",
+]
+
+ENGAGEMENT_UNREADABLE = """
+SELECT t AS "Table"
+FROM UNNEST(CAST(:tables AS TEXT[])) AS t
+WHERE to_regclass('public.' || t) IS NOT NULL
+  AND NOT has_table_privilege('public.' || t, 'SELECT')
+"""
+
+# The monitor never fills customer_name (empty on every interaction), so the
+# name comes from, in order: the WhatsApp username, then the Odoo customer
+# whose phone ends in the same nine digits (phone_key is exactly that).
+# Covers 45% of interactions for 1-22 Sep 2026; the rest have only a number.
+_WA_PARTNER_BY_PHONE = """
+partner_by_phone AS (
+    SELECT DISTINCT ON (k.key) k.key, rp.name
+    FROM res_partner rp
+    CROSS JOIN LATERAL (VALUES (
+        RIGHT(REGEXP_REPLACE(COALESCE(rp.phone, rp.mobile), '\\D', '', 'g'), 9)
+    )) AS k(key)
+    WHERE rp.active
+      AND COALESCE(rp.phone, rp.mobile) IS NOT NULL
+      AND k.key IN (
+          SELECT phone_key FROM denri_monitor_interaction
+          WHERE {date_col} BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+      )
+    ORDER BY k.key, rp.id DESC
+)
+"""
+_WA_NAME = """COALESCE(NULLIF(TRIM(i.customer_name), ''), NULLIF(TRIM(i.wa_username), ''),
+             pbp.name, 'Unknown')"""
+
+# Only the columns the page reads: the dashboard runs over links as slow as
+# 10 KB/s, where every unused column is paid for on every refresh.
+WA_INTERACTIONS = "WITH " + _WA_PARTNER_BY_PHONE.format(date_col="date") + """
+SELECT
+    i.id                                                            AS "ID",
+    i.date                                                          AS "Date",
+    """ + _WA_NAME + """                                            AS "Name",
+    COALESCE(NULLIF(TRIM(i.phone), ''), i.phone_clean)              AS "Contact",
+    COALESCE(src.name, 'Not recorded')                              AS "Source",
+    CASE i.activity
+        WHEN 'enquiry'       THEN 'Enquiry'
+        WHEN 'purchased'     THEN 'Purchased'
+        WHEN 'not_purchased' THEN 'Not Purchased'
+        WHEN 'visit_shop'    THEN 'Visit Shop'
+        WHEN 'transferred'   THEN 'Transferred'
+        ELSE COALESCE(i.activity, 'Not recorded')
+    END                                                             AS "Activity",
+    COALESCE(sh.name, 'Not recorded')                               AS "Branch",
+    (i.activity = 'purchased' OR COALESCE(i.is_purchased, FALSE))   AS "Converted",
+    (COALESCE(rsn.is_out_of_stock, FALSE)
+        OR i.oos_bag_id IS NOT NULL
+        OR i.oos_product_id IS NOT NULL)                            AS "Out of Stock",
+    i.response_time_first                                           AS "First Response (min)",
+    -- Feedback link sent to the customer from this chat, and which kind.
+    COALESCE(i.feedback_sent, FALSE)                                AS "Feedback Sent",
+    CASE i.feedback_type
+        WHEN 'after_purchase' THEN 'Purchase Link'
+        WHEN 'enquiry'        THEN 'Enquiry Link'
+        WHEN 'walkin'         THEN 'Walk-in Link'
+        ELSE CASE WHEN i.feedback_sent THEN 'Type not recorded' END
+    END                                                             AS "Feedback Link",
+    -- Transfers: where it went, why, and what happened once it got there.
+    to_sh.name                                                      AS "Transferred To",
+    trs.name                                                        AS "Transfer Reason",
+    i.transferred_to_id IS NOT NULL                                 AS "Destination Linked",
+    CASE dest.activity
+        WHEN 'enquiry'       THEN 'Enquiry'
+        WHEN 'purchased'     THEN 'Purchased'
+        WHEN 'not_purchased' THEN 'Not Purchased'
+        WHEN 'visit_shop'    THEN 'Visit Shop'
+        WHEN 'transferred'   THEN 'Transferred'
+    END                                                             AS "Outcome at Destination",
+    (dest.activity = 'purchased'
+        OR COALESCE(dest.is_purchased, FALSE))                      AS "Converted at Destination",
+    i.transferred_from_id IS NOT NULL                               AS "Transferred In"
+FROM denri_monitor_interaction i
+LEFT JOIN denri_monitor_shop            sh      ON sh.id      = i.shop_id
+LEFT JOIN partner_by_phone              pbp     ON pbp.key    = i.phone_key
+LEFT JOIN denri_monitor_source          src     ON src.id     = i.source_id
+LEFT JOIN denri_monitor_reason          rsn     ON rsn.id     = i.reason_id
+LEFT JOIN denri_monitor_shop            to_sh   ON to_sh.id   = i.transfer_to_shop_id
+LEFT JOIN denri_monitor_transfer_reason trs     ON trs.id     = i.transfer_reason_id
+LEFT JOIN denri_monitor_interaction     dest    ON dest.id    = i.transferred_to_id
+WHERE i.date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+ORDER BY i.date DESC, i.id DESC
+"""
+
+# Every product a customer asked for that was out of stock. An interaction can
+# name several (oos_product_ids) as well as a primary product and a bag from
+# the monitor's own bag list; each distinct one counts once per interaction.
+WA_OUT_OF_STOCK = "WITH " + _WA_PARTNER_BY_PHONE.format(date_col="date") + """,
+wanted AS (
+    SELECT r.interaction_id, pt.name AS product
+    FROM denri_monitor_interaction_oos_product_rel r
+    JOIN product_template pt ON pt.id = r.product_id
+    UNION
+    SELECT i.id, pt.name
+    FROM denri_monitor_interaction i
+    JOIN product_template pt ON pt.id = i.oos_product_id
+    UNION
+    SELECT i.id, b.name
+    FROM denri_monitor_interaction i
+    JOIN denri_monitor_bag b ON b.id = i.oos_bag_id
+)
+SELECT
+    i.id                                                AS "ID",
+    i.date                                              AS "Date",
+    """ + _WA_NAME + """                                AS "Name",
+    COALESCE(NULLIF(TRIM(i.phone), ''), i.phone_clean)  AS "Contact",
+    COALESCE(sh.name, 'Not recorded')                   AS "Branch",
+    w.product                                           AS "Product Wanted",
+    rsn.name                                            AS "Reason"
+FROM wanted w
+JOIN denri_monitor_interaction i   ON i.id   = w.interaction_id
+LEFT JOIN denri_monitor_shop   sh  ON sh.id  = i.shop_id
+LEFT JOIN partner_by_phone     pbp ON pbp.key = i.phone_key
+LEFT JOIN denri_monitor_reason rsn ON rsn.id = i.reason_id
+WHERE i.date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+ORDER BY i.date DESC
+"""
+
+# Follow-up outcomes are recorded on the interaction being followed up
+# (followup_outcome / followup_recorded_on), not on the generated call-list
+# items: every one of the 3,340 items ever generated has no outcome, while
+# 7,627 interactions carry one. Ranged on when the follow-up was recorded.
+WA_FOLLOWUPS = "WITH " + _WA_PARTNER_BY_PHONE.format(date_col="followup_recorded_on::DATE") + """
+SELECT
+    i.id                                                AS "ID",
+    i.followup_recorded_on::DATE                        AS "Followed Up On",
+    i.date                                              AS "Original Date",
+    """ + _WA_NAME + """                                AS "Name",
+    COALESCE(NULLIF(TRIM(i.phone), ''), i.phone_clean)  AS "Contact",
+    COALESCE(sh.name, 'Not recorded')                   AS "Branch",
+    CASE i.activity
+        WHEN 'enquiry'       THEN 'Enquiry'
+        WHEN 'purchased'     THEN 'Purchased'
+        WHEN 'not_purchased' THEN 'Not Purchased'
+        WHEN 'visit_shop'    THEN 'Visit Shop'
+        WHEN 'transferred'   THEN 'Transferred'
+        ELSE COALESCE(i.activity, 'Not recorded')
+    END                                                 AS "Original Activity",
+    CASE i.followup_outcome
+        WHEN 'already_purchased' THEN 'Already Purchased'
+        WHEN 'enquiry'           THEN 'Enquiries'
+        WHEN 'out_of_stock'      THEN 'Out of Stock'
+        WHEN 'purchase_later'    THEN 'Purchase Later'
+        WHEN 'purchased'         THEN 'Purchased'
+        WHEN 'visit_shop'        THEN 'Visit the Shop'
+        WHEN 'not_reachable'     THEN 'Not Reachable'
+    END                                                 AS "Follow-up Outcome",
+    i.followup_note                                     AS "Note"
+FROM denri_monitor_interaction i
+LEFT JOIN denri_monitor_shop sh  ON sh.id   = i.shop_id
+LEFT JOIN partner_by_phone   pbp ON pbp.key = i.phone_key
+WHERE i.followup_outcome IS NOT NULL
+  AND i.followup_recorded_on::DATE BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+ORDER BY i.followup_recorded_on DESC
+"""
+
+# The call-back lists generated for agents, for context beside the outcomes.
+WA_FOLLOWUP_LISTS = """
+SELECT
+    COUNT(*)                        AS "Lists",
+    COALESCE(SUM(item_count), 0)    AS "Customers Listed"
+FROM denri_monitor_followup
+WHERE generated_on BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+"""
+
+SOCIAL_DMS = """
+SELECT
+    dm.id                                               AS "ID",
+    dm.date                                             AS "Date",
+    COALESCE(NULLIF(TRIM(dm.phone), ''),
+             NULLIF(TRIM(dm.alt_phone), ''))            AS "Contact",
+    COALESCE(NULLIF(TRIM(dm.customer_name), ''),
+             NULLIF(TRIM(dm.handle), ''))               AS "Name",
+    COALESCE(sh.name, 'Not transferred')                AS "Branch",
+    -- Named the way the WhatsApp Monitor names its sources, so one source
+    -- reads the same in both apps: an ad by the network it ran on, and an
+    -- unpaid DM as new or existing direct contact.
+    CASE
+        WHEN dm.is_ad AND ch.name ILIKE '%instagram%' THEN 'Meta Ad - Instagram'
+        WHEN dm.is_ad AND ch.name ILIKE '%facebook%'  THEN 'Meta Ad - Facebook'
+        WHEN dm.is_ad AND ch.name ILIKE '%tiktok%'    THEN 'TikTok Ad'
+        WHEN dm.is_ad AND ch.name ILIKE 'x %'         THEN 'X Ad'
+        WHEN dm.is_ad                                 THEN 'Ad - ' || COALESCE(ch.name, 'Unknown Platform')
+        WHEN dm.customer_status = 'existing'          THEN 'Existing Direct'
+        WHEN dm.customer_status = 'new'               THEN 'New Direct'
+        ELSE 'Direct'
+    END                                                 AS "Source",
+    COALESCE(dm.is_ad, FALSE)                           AS "From Ad",
+    COALESCE(ch.name, 'Not recorded')                   AS "Platform",
+    CASE dm.customer_status
+        WHEN 'new' THEN 'New' WHEN 'existing' THEN 'Existing'
+        ELSE 'Not recorded'
+    END                                                 AS "Customer",
+    COALESCE(dm.is_converted, FALSE)                    AS "Converted",
+    CASE dm.convert_stage
+        WHEN 'shop'  THEN 'Shop'
+        WHEN 'call1' THEN 'Call 1'
+        WHEN 'call2' THEN 'Call 2'
+        WHEN 'pos'   THEN 'POS'
+        ELSE 'Not Converted'
+    END                                                 AS "Converted At",
+    CASE dm.call_status
+        WHEN 'na'             THEN 'No follow-up needed'
+        WHEN 'awaiting_call1' THEN 'Awaiting Call 1'
+        WHEN 'awaiting_call2' THEN 'Awaiting Call 2'
+        WHEN 'closed'         THEN 'Follow-up closed'
+    END                                                 AS "Call Status",
+    dm.next_call_due                                    AS "Next Call Due",
+    so.name                                             AS "Shop Outcome",
+    pt.name                                             AS "Product Interested In",
+    agent_p.name                                        AS "Logged By"
+FROM denri_social_dm dm
+LEFT JOIN denri_monitor_shop        sh      ON sh.id      = dm.shop_id
+LEFT JOIN denri_social_channel      ch      ON ch.id      = dm.channel_id
+LEFT JOIN denri_social_shop_outcome so      ON so.id      = dm.shop_outcome_id
+LEFT JOIN product_template          pt      ON pt.id      = dm.product_id
+LEFT JOIN res_users                 agent   ON agent.id   = dm.agent_id
+LEFT JOIN res_partner               agent_p ON agent_p.id = agent.partner_id
+WHERE dm.date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+ORDER BY dm.date DESC, dm.id DESC
+"""
+
+
+# Everything the bags-sold count leaves out, so it can still be watched.
+# Same date range, same shop names and the same counting as BAGS_SOLD_BY_CATEGORY
+# (a refunded item counts as a movement), but only the lines that do NOT make it
+# into bags sold — accessories, delivery fees, order-level discounts, non-bag
+# items, and anything rung at a non-shop till. Combo containers are left out:
+# their bags are already counted.
+EXCLUDED_FROM_BAGS_SOLD = """
+SELECT
+    COALESCE(pt."name", '<<unknown>>')                       AS "Item",
+    COALESCE(pcat."name", 'No category')                     AS "Category",
+    CASE
+        WHEN pt."name" ILIKE '%Delivery Fee%'                THEN 'Delivery fee'
+        WHEN pt."name" ILIKE '%KES discount%'                THEN 'Order discount'
+        WHEN COALESCE(pcat."name", '') ILIKE '%Pos%'         THEN 'POS material'
+        WHEN COALESCE(pcat."name", '') = 'Accessories'
+         AND pt."name" ILIKE '%Strap%'                       THEN 'Strap'
+        WHEN COALESCE(pcat."name", '') = 'Accessories'       THEN 'Accessory'
+        WHEN p.session_id IS NOT NULL
+         AND (COALESCE(pc."name", '') = ''
+              OR pc."name" ILIKE '%Flash Sale%')             THEN 'Non-shop till'
+        ELSE 'Not a bag'
+    END                                                      AS "Reason",
+    CASE
+        WHEN lower(pc."name") IN ('website sales','website','jumia')
+          OR p.session_id IS NULL                            THEN 'WEBSITE'
+        WHEN lower(pc."name") IN ('sinza','dar-es-alam')     THEN 'SINZA'
+        WHEN lower(pc."name") IN ('ktda','ktda shop')        THEN 'KTDA'
+        WHEN COALESCE(pc."name", '') = ''                    THEN 'NO TILL'
+        ELSE UPPER(pc."name")
+    END                                                      AS "Shop",
+    SUM(pl.qty)                                              AS "Qty",
+    ROUND(SUM(pl.price_subtotal_incl
+              / COALESCE(NULLIF(p.currency_rate, 0), 1))::NUMERIC, 2) AS "KES"
+FROM pos_order p
+JOIN pos_order_line pl ON pl.order_id = p.id
+LEFT JOIN pos_session ps ON ps.id = p.session_id
+LEFT JOIN pos_config pc ON pc.id = ps.config_id
+LEFT JOIN product_product pp ON pp.id = pl.product_id
+LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id
+LEFT JOIN product_category pcat ON pcat.id = pt.categ_id
+CROSS JOIN (
+    SELECT CAST(:start_date AS DATE) AS start_date,
+           CAST(:end_date AS DATE)   AS end_date
+) dr
+WHERE p.date_order::date BETWEEN dr.start_date AND dr.end_date
+  AND p.state IN ('done', 'paid', 'invoiced')
+  AND pl.qty <> 0
+  -- Combo containers are not excluded stock: the bags inside them are counted
+  -- in bags sold on their own lines, so listing the container here as well
+  -- read as if those sales had gone missing.
+  AND COALESCE(pl.is_combo_line, FALSE) = FALSE
+  AND COALESCE(pt.is_combo, FALSE) = FALSE
+  -- The complement of the bags-sold rule: a bag or gift bag that is not a
+  -- combo container and was sold at a shop till is counted there, not here.
+  AND NOT (
+        (COALESCE(pcat."name", '') ILIKE 'Bags%'
+         OR COALESCE(pt."name", '') ILIKE '%Gift Bag%')
+    AND COALESCE(pl.is_combo_line, FALSE) = FALSE
+    AND COALESCE(pt.is_combo, FALSE) = FALSE
+    AND (p.session_id IS NULL
+         OR (COALESCE(pc."name", '') <> '' AND pc."name" NOT ILIKE '%Flash Sale%'))
+  )
+GROUP BY 1, 2, 3, 4
+HAVING SUM(pl.qty) <> 0
+ORDER BY "Reason", SUM(pl.qty) DESC
+"""
+
+
+# One row per POS session for each shop attendant who served in it, with the
+# sales that attendant made. Cashier is the person who opened the session (the
+# till's "Opened By"): the order-level "cashier" field Odoo fills from the
+# logged-in user was the same name as the attendant on every one of 13,151
+# orders in September 2026, so it says nothing the attendant column does not.
+# Sales Made follows the Sales page: every line except delivery fees, in KES
+# at each order's own rate, refunds netted.
+SHOP_ATTENDANT_SESSIONS = """
+SELECT
+    po.date_order::DATE                                              AS "Date",
+    CASE
+        WHEN lower(pconf.name) IN ('website sales', 'website', 'jumia') OR po.session_id IS NULL
+            THEN 'Website'
+        WHEN lower(pconf.name) = 'staff pos'
+            THEN 'Staff POS'
+        WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%'
+            THEN 'Sinza'
+        ELSE INITCAP(TRIM(REGEXP_REPLACE(
+                COALESCE(sw.name, sl.complete_name, pconf.name, 'N/A'),
+                '\s*Shop\s*', '', 'gi')))
+    END                                                              AS "Location",
+    ROUND(SUM(CASE WHEN pt.name NOT ILIKE '%Delivery Fee%'
+                   THEN pol.price_subtotal_incl / COALESCE(NULLIF(po.currency_rate, 0), 1)
+                   ELSE 0 END)::NUMERIC, 2)                          AS "Sales Made",
+    -- An order carries a shop attendant or a brand ambassador, never both
+    -- (BAs started at Hilton on 1 Oct 2026); "Not recorded" means neither.
+    CASE WHEN NULLIF(TRIM(att_p.name), '') IS NULL AND NULLIF(TRIM(ba.name), '') IS NULL
+         THEN 'Not recorded' ELSE COALESCE(TRIM(att_p.name), '') END AS "Shop Attendant",
+    COALESCE(TRIM(ba.name), '')                                      AS "Brand Ambassador (BA)",
+    COALESCE(NULLIF(TRIM(open_p.name), ''), 'Not recorded')          AS "Cashier",
+    ps.name                                                          AS "Session",
+    COUNT(DISTINCT po.id)                                            AS "Orders"
+FROM pos_order po
+JOIN pos_order_line            pol    ON pol.order_id = po.id
+JOIN product_product           pp     ON pp.id = pol.product_id
+JOIN product_template          pt     ON pt.id = pp.product_tmpl_id
+LEFT JOIN pos_session          ps     ON ps.id = po.session_id
+LEFT JOIN pos_config           pconf  ON pconf.id = ps.config_id
+LEFT JOIN stock_picking_type   spt    ON spt.id = pconf.picking_type_id
+LEFT JOIN stock_warehouse      sw     ON sw.id = spt.warehouse_id
+LEFT JOIN stock_location       sl     ON sl.id = spt.default_location_src_id
+LEFT JOIN res_users            att    ON att.id = po.attendant_id
+LEFT JOIN res_partner          att_p  ON att_p.id = att.partner_id
+LEFT JOIN pos_shop_ba          ba     ON ba.id = po.ba_id
+LEFT JOIN res_users            opener ON opener.id = ps.user_id
+LEFT JOIN res_partner          open_p ON open_p.id = opener.partner_id
+WHERE po.state IN ('done', 'paid', 'invoiced')
+  AND po.date_order >= CAST(:start_date AS TIMESTAMP)
+  AND po.date_order < CAST(:end_date AS TIMESTAMP) + INTERVAL '1 day'
+GROUP BY 1, 2, 4, 5, 6, 7
+ORDER BY "Date" DESC, "Location", "Session", "Sales Made" DESC
+"""
+
+
+# The orders behind SHOP_ATTENDANT_SESSIONS' "Not recorded": no shop attendant
+# and no brand ambassador on the order. One row per order, same location
+# names and the same Sales Made, with what was sold so it can be traced.
+UNRECORDED_ORDERS = """
+SELECT
+    po.date_order::DATE                                              AS "Date",
+    TO_CHAR(po.date_order AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Nairobi', 'HH24:MI') AS "Time",
+    CASE
+        WHEN lower(pconf.name) IN ('website sales', 'website', 'jumia') OR po.session_id IS NULL
+            THEN 'Website'
+        WHEN lower(pconf.name) = 'staff pos'
+            THEN 'Staff POS'
+        WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%'
+            THEN 'Sinza'
+        ELSE INITCAP(TRIM(REGEXP_REPLACE(
+                COALESCE(sw.name, sl.complete_name, pconf.name, 'N/A'),
+                '\\s*Shop\\s*', '', 'gi')))
+    END                                                              AS "Location",
+    po.name                                                          AS "Order",
+    ps.name                                                          AS "Session",
+    COALESCE(NULLIF(TRIM(open_p.name), ''), 'Not recorded')          AS "Cashier",
+    COALESCE(NULLIF(TRIM(cust.name), ''), 'Walk-in (no name)')       AS "Customer",
+    NULLIF(TRIM(COALESCE(cust.phone, cust.mobile, '')), '')          AS "Phone",
+    STRING_AGG(DISTINCT pt.name, ', ')
+        FILTER (WHERE pt.name NOT ILIKE '%Delivery Fee%')            AS "Items",
+    ROUND(SUM(CASE WHEN pt.name NOT ILIKE '%Delivery Fee%'
+                   THEN pol.price_subtotal_incl / COALESCE(NULLIF(po.currency_rate, 0), 1)
+                   ELSE 0 END)::NUMERIC, 2)                          AS "Sales Made"
+FROM pos_order po
+JOIN pos_order_line            pol    ON pol.order_id = po.id
+JOIN product_product           pp     ON pp.id = pol.product_id
+JOIN product_template          pt     ON pt.id = pp.product_tmpl_id
+LEFT JOIN pos_session          ps     ON ps.id = po.session_id
+LEFT JOIN pos_config           pconf  ON pconf.id = ps.config_id
+LEFT JOIN stock_picking_type   spt    ON spt.id = pconf.picking_type_id
+LEFT JOIN stock_warehouse      sw     ON sw.id = spt.warehouse_id
+LEFT JOIN stock_location       sl     ON sl.id = spt.default_location_src_id
+LEFT JOIN res_users            att    ON att.id = po.attendant_id
+LEFT JOIN res_partner          att_p  ON att_p.id = att.partner_id
+LEFT JOIN pos_shop_ba          ba     ON ba.id = po.ba_id
+LEFT JOIN res_users            opener ON opener.id = ps.user_id
+LEFT JOIN res_partner          open_p ON open_p.id = opener.partner_id
+LEFT JOIN res_partner          cust   ON cust.id = po.partner_id
+WHERE po.state IN ('done', 'paid', 'invoiced')
+  AND po.date_order >= CAST(:start_date AS TIMESTAMP)
+  AND po.date_order < CAST(:end_date AS TIMESTAMP) + INTERVAL '1 day'
+  AND NULLIF(TRIM(att_p.name), '') IS NULL
+  AND NULLIF(TRIM(ba.name), '') IS NULL
+GROUP BY po.id, ps.name, pconf.name, sw.name, sl.complete_name, open_p.name,
+         cust.name, cust.phone, cust.mobile
+ORDER BY po.date_order DESC
+"""
+
+
+# Everything one shop attendant or brand ambassador sold: one line per customer
+# and product for each day, units bundled together (two Kai Black on the same
+# day read as one line of 2). Refunds are folded into the sale they reverse —
+# every September 2026 refund was rung the same day — so a returned bag
+# disappears and a part-refunded line shows what was kept. Delivery fees and
+# order-level discount lines are money rather than products, so they are left
+# out; a combo appears as its own line with its price, beside the bags inside
+# it at no charge.
+SHOP_ATTENDANT_SALES = """
+WITH refunded AS (
+    SELECT r.refunded_orderline_id AS line_id,
+           SUM(r.qty) AS qty, SUM(r.price_subtotal_incl) AS amount
+    FROM pos_order_line r
+    WHERE r.refunded_orderline_id IS NOT NULL
+    GROUP BY r.refunded_orderline_id
+),
+lines AS (
+    SELECT
+        po.date_order::DATE                                          AS sale_date,
+        po.name                                                      AS order_ref,
+        COALESCE(NULLIF(TRIM(cust.name), ''), 'Walk-in (no name)')   AS customer,
+        NULLIF(REGEXP_REPLACE(
+            REGEXP_REPLACE(COALESCE(cust.phone, cust.mobile, ''), '[^0-9]', '', 'g'),
+            '^(254|255|256)', '0'), '')                              AS phone,
+        pt.name                                                      AS product,
+        pol.qty + COALESCE(ref.qty, 0)                               AS qty,
+        (pol.price_subtotal_incl + COALESCE(ref.amount, 0))
+            / COALESCE(NULLIF(po.currency_rate, 0), 1)               AS total,
+        CASE
+            WHEN lower(pconf.name) IN ('website sales', 'website', 'jumia') THEN 'Website'
+            WHEN lower(pconf.name) = 'staff pos' THEN 'Staff POS'
+            WHEN lower(pconf.name) IN ('dar-es-alam', 'sinza') THEN 'Sinza'
+            ELSE INITCAP(TRIM(REGEXP_REPLACE(COALESCE(pconf.name, 'N/A'), '\s*Shop\s*', '', 'gi')))
+        END                                                          AS location
+    FROM pos_order po
+    JOIN pos_order_line       pol   ON pol.order_id = po.id
+    JOIN product_product      pp    ON pp.id = pol.product_id
+    JOIN product_template     pt    ON pt.id = pp.product_tmpl_id
+    LEFT JOIN refunded        ref   ON ref.line_id = pol.id
+    LEFT JOIN res_partner     cust  ON cust.id = po.partner_id
+    LEFT JOIN pos_session     ps    ON ps.id = po.session_id
+    LEFT JOIN pos_config      pconf ON pconf.id = ps.config_id
+    LEFT JOIN res_users       att   ON att.id = po.attendant_id
+    LEFT JOIN res_partner     att_p ON att_p.id = att.partner_id
+    LEFT JOIN pos_shop_ba     ba    ON ba.id = po.ba_id
+    WHERE po.state IN ('done', 'paid', 'invoiced')
+      AND po.date_order >= CAST(:start_date AS TIMESTAMP)
+      AND po.date_order < CAST(:end_date AS TIMESTAMP) + INTERVAL '1 day'
+      AND (TRIM(att_p.name) = :person OR TRIM(ba.name) = :person)
+      AND pol.qty > 0
+      AND pt.name NOT ILIKE '%Delivery Fee%'
+      AND pt.name NOT ILIKE '%KES discount%'
+      AND NOT (pol.qty + COALESCE(ref.qty, 0) = 0
+               AND pol.price_subtotal_incl + COALESCE(ref.amount, 0) = 0)
+)
+SELECT
+    sale_date                                   AS "Date",
+    customer                                    AS "Customer",
+    phone                                       AS "Phone",
+    product                                     AS "Product",
+    SUM(qty)                                    AS "Quantity",
+    ROUND(SUM(total)::NUMERIC, 2)               AS "Total",
+    location                                    AS "Location",
+    string_agg(DISTINCT order_ref, ', ')        AS "Orders"
+FROM lines
+GROUP BY sale_date, customer, phone, product, location
+ORDER BY "Date" DESC, "Customer", "Product"
+"""
+
+
+# The customers each shop attendant or brand ambassador converted: one row per
+# person and customer, with the phone number feedback is matched on. A
+# conversion is an order still worth something once refunds against its lines
+# are taken off, so a sale refunded in full does not count. Phone Key is the
+# last nine digits, which is how the same number written 07..., 2547... or
+# +254 7... compares equal.
+SHOP_ATTENDANT_CUSTOMERS = """
+WITH refunded AS (
+    SELECT r.refunded_orderline_id AS line_id, SUM(r.price_subtotal_incl) AS amount
+    FROM pos_order_line r
+    WHERE r.refunded_orderline_id IS NOT NULL
+    GROUP BY r.refunded_orderline_id
+),
+orders AS (
+    SELECT
+        po.id,
+        po.date_order::DATE                                          AS sale_date,
+        CASE WHEN NULLIF(TRIM(ba.name), '') IS NOT NULL THEN TRIM(ba.name) || ' (BA)'
+             ELSE COALESCE(NULLIF(TRIM(att_p.name), ''), 'Not recorded') END AS person,
+        CASE
+            WHEN lower(pconf.name) IN ('website sales', 'website', 'jumia') THEN 'Website'
+            WHEN lower(pconf.name) = 'staff pos' THEN 'Staff POS'
+            WHEN lower(pconf.name) IN ('dar-es-alam', 'sinza') THEN 'Sinza'
+            ELSE INITCAP(TRIM(REGEXP_REPLACE(COALESCE(pconf.name, 'N/A'), '\s*Shop\s*', '', 'gi')))
+        END                                                          AS location,
+        COALESCE(NULLIF(TRIM(cust.name), ''), 'Walk-in (no name)')   AS customer,
+        REGEXP_REPLACE(COALESCE(cust.phone, cust.mobile, ''), '[^0-9]', '', 'g') AS digits,
+        SUM(pol.price_subtotal_incl + COALESCE(ref.amount, 0))       AS net
+    FROM pos_order po
+    JOIN pos_order_line   pol   ON pol.order_id = po.id
+    LEFT JOIN refunded    ref   ON ref.line_id = pol.id
+    LEFT JOIN res_partner cust  ON cust.id = po.partner_id
+    LEFT JOIN pos_session ps    ON ps.id = po.session_id
+    LEFT JOIN pos_config  pconf ON pconf.id = ps.config_id
+    LEFT JOIN res_users   att   ON att.id = po.attendant_id
+    LEFT JOIN res_partner att_p ON att_p.id = att.partner_id
+    LEFT JOIN pos_shop_ba ba    ON ba.id = po.ba_id
+    WHERE po.state IN ('done', 'paid', 'invoiced')
+      AND po.date_order >= CAST(:start_date AS TIMESTAMP)
+      AND po.date_order < CAST(:end_date AS TIMESTAMP) + INTERVAL '1 day'
+      AND pol.qty > 0
+    GROUP BY 1, 2, 3, 4, 5, 6
+)
+SELECT
+    person                                                           AS "Served By",
+    location                                                         AS "Location",
+    customer                                                         AS "Customer",
+    CASE WHEN LENGTH(digits) >= 9 THEN '0' || RIGHT(digits, 9) END   AS "Phone",
+    CASE WHEN LENGTH(digits) >= 9 THEN RIGHT(digits, 9) END          AS "Phone Key",
+    MIN(sale_date)                                                   AS "First Purchase",
+    COUNT(*)                                                         AS "Orders"
+FROM orders
+WHERE net > 0
+GROUP BY 1, 2, 3, 4, 5
+ORDER BY 1, 3
+"""
+
+
+# Shop performance by week or month (:grain = 'week' | 'month'). One row per
+# location and period, counted the same way as the rest of the dashboard:
+#   Revenue  — every line except delivery fees, in KES, refunds netted (Sales page)
+#   Bags     — bags and gift bags, no combo containers, refunds netted (Bags Sold)
+#   Orders   — orders still worth something after refunds; refund slips are not sales
+#   Customers / New Customers — distinct buyers; "new" means their first purchase
+#              anywhere in the company falls in this period
+#   Refunded — the value handed back, as a positive amount
+SHOP_PERFORMANCE = """
+WITH
+-- A customer is their phone number (last nine digits), falling back to the
+-- Odoo customer record: 12,108 numbers sit on more than one record, and the
+-- same person should not count as new twice.
+buyers AS (
+    SELECT po.id AS order_id,
+           COALESCE(NULLIF(RIGHT(REGEXP_REPLACE(COALESCE(rp.phone, rp.mobile, ''), '[^0-9]', '', 'g'), 9), ''),
+                    'p' || po.partner_id::TEXT)               AS customer_key
+    FROM pos_order po
+    JOIN res_partner rp ON rp.id = po.partner_id
+    WHERE po.state IN ('done', 'paid', 'invoiced')
+),
+first_purchase AS (
+    SELECT b.customer_key, MIN(po.date_order)::DATE AS first_day
+    FROM pos_order po
+    JOIN buyers b ON b.order_id = po.id
+    WHERE po.amount_total > 0
+    GROUP BY b.customer_key
+),
+orders AS (
+    SELECT
+        po.id,
+        b.customer_key,
+        -- Weeks run Sunday to Saturday, as the business reports them.
+        (CASE WHEN CAST(:grain AS TEXT) = 'week' THEN po.date_order::DATE - EXTRACT(DOW FROM po.date_order)::INT ELSE DATE_TRUNC('month', po.date_order)::DATE END) AS period,
+        CASE
+            WHEN lower(pconf.name) IN ('website sales', 'website', 'jumia') OR po.session_id IS NULL
+                THEN 'Website'
+            WHEN lower(pconf.name) = 'staff pos'
+                THEN 'Staff POS'
+            WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%'
+                THEN 'Sinza'
+            ELSE INITCAP(TRIM(REGEXP_REPLACE(
+                    COALESCE(sw.name, sl.complete_name, 'N/A'), '\s*Shop\s*', '', 'gi')))
+        END                                                          AS location,
+        SUM(CASE WHEN pt.name NOT ILIKE '%Delivery Fee%'
+                 THEN pol.price_subtotal_incl / COALESCE(NULLIF(po.currency_rate, 0), 1)
+                 ELSE 0 END)                                         AS revenue,
+        SUM(CASE WHEN (COALESCE(pc.name, '') ILIKE 'Bags%' OR pt.name ILIKE '%Gift Bag%')
+                  AND COALESCE(pol.is_combo_line, FALSE) = FALSE
+                  AND COALESCE(pt.is_combo, FALSE) = FALSE
+                 THEN pol.qty ELSE 0 END)                            AS bags,
+        -- Genuine returns only: a refund of 50+ units is a mis-keyed sale being
+        -- reversed (Kakamega's 4,444 Remi Grey on 12 Sep 2026), and counting it
+        -- would put Kakamega's September refund rate at 1,500%.
+        SUM(CASE WHEN pol.qty < 0 AND pol.qty > -50
+                 THEN -pol.price_subtotal_incl / COALESCE(NULLIF(po.currency_rate, 0), 1)
+                 ELSE 0 END)                                         AS refunded
+    FROM pos_order po
+    JOIN pos_order_line           pol   ON pol.order_id = po.id
+    JOIN product_product          pp    ON pp.id = pol.product_id
+    JOIN product_template         pt    ON pt.id = pp.product_tmpl_id
+    LEFT JOIN product_category    pc    ON pc.id = pt.categ_id
+    LEFT JOIN buyers              b     ON b.order_id = po.id
+    LEFT JOIN pos_session         ps    ON ps.id = po.session_id
+    LEFT JOIN pos_config          pconf ON pconf.id = ps.config_id
+    LEFT JOIN stock_picking_type  spt   ON spt.id = pconf.picking_type_id
+    LEFT JOIN stock_warehouse     sw    ON sw.id = spt.warehouse_id
+    LEFT JOIN stock_location      sl    ON sl.id = spt.default_location_src_id
+    WHERE po.state IN ('done', 'paid', 'invoiced')
+      AND po.date_order >= CAST(:start_date AS TIMESTAMP)
+      AND po.date_order < CAST(:end_date AS TIMESTAMP) + INTERVAL '1 day'
+    GROUP BY 1, 2, 3, 4
+)
+SELECT
+    o.location                                                       AS "Location",
+    o.period                                                         AS "Period",
+    ROUND(SUM(o.revenue)::NUMERIC, 2)                                AS "Revenue",
+    COUNT(*) FILTER (WHERE o.revenue > 0)                            AS "Orders",
+    SUM(o.bags)                                                      AS "Bags",
+    COUNT(DISTINCT o.customer_key) FILTER (WHERE o.revenue > 0)      AS "Customers",
+    COUNT(DISTINCT o.customer_key) FILTER (
+        WHERE o.revenue > 0
+          AND (CASE WHEN CAST(:grain AS TEXT) = 'week' THEN fp.first_day::DATE - EXTRACT(DOW FROM fp.first_day)::INT ELSE DATE_TRUNC('month', fp.first_day)::DATE END) = o.period)  AS "New Customers",
+    ROUND(SUM(o.refunded)::NUMERIC, 2)                               AS "Refunded"
+FROM orders o
+LEFT JOIN first_purchase fp ON fp.customer_key = o.customer_key
+GROUP BY 1, 2
+ORDER BY 1, 2
+"""
+
+# Sales targets per location for each week or month (:grain = 'week' | 'month'),
+# from the same table and name matching the Sales page uses (a target is named
+# after its till, e.g. "HAZINA (…)").
+SHOP_TARGETS = """
+WITH mapping(location, target_branch) AS (
+    VALUES ('Sinza', 'DAR-ES-ALAM'), ('Website', 'WEBSITE SALES'), ('Ktda', 'KTDA Shop'),
+           ('Hilton', 'HILTON'), ('Busia', 'BUSIA'), ('Kisumu', 'KISUMU'), ('Thika', 'THIKA'),
+           ('Hazina', 'HAZINA'), ('Mombasa', 'MOMBASA'), ('Uganda', 'UGANDA'),
+           ('Starmall', 'STARMALL'), ('Nanyuki', 'NANYUKI'), ('Nyeri', 'NYERI'), ('Nakuru', 'NAKURU'),
+           ('Eldoret', 'ELDORET'), ('Rongai', 'RONGAI'), ('Kisii', 'KISII'),
+           ('Kakamega', 'KAKAMEGA'), ('Kitengela', 'KITENGELA'), ('Meru', 'MERU')
+)
+-- Monthly targets: one per month.
+SELECT m.location AS "Location", DATE_TRUNC('month', t.start_date)::DATE AS "Period",
+       SUM(t.target_amount) AS "Target"
+FROM sales_pos_target t
+JOIN mapping m ON t.name ILIKE m.target_branch || '%'
+WHERE t.period = 'month' AND CAST(:grain AS TEXT) = 'month'
+GROUP BY 1, 2
+
+UNION ALL
+
+-- Weekly targets are stored one per month (the 1st to the last day), holding
+-- the target for each week in it. Every Sunday-to-Saturday week whose Sunday
+-- falls in that month takes it.
+SELECT m.location, weeks.sunday::DATE, SUM(t.target_amount)
+FROM sales_pos_target t
+JOIN mapping m ON t.name ILIKE m.target_branch || '%'
+CROSS JOIN LATERAL generate_series(
+    t.start_date + ((7 - EXTRACT(DOW FROM t.start_date)::INT) % 7),
+    t.end_date, INTERVAL '7 days') AS weeks(sunday)
+WHERE t.period = 'week' AND CAST(:grain AS TEXT) = 'week'
+GROUP BY 1, 2
+"""
+
+
+# Every sales target row, named to the Sales page's branch names. Odoo stores
+# one row per shop per month for each kind of target (day, week, month), the
+# amount being one day's, one week's or the whole month's target. lib.targets
+# picks and scales them to the period being viewed.
+SALES_TARGET_ROWS = """
+WITH mapping(location, target_branch) AS (
+    VALUES ('Sinza', 'DAR-ES-ALAM'), ('Website', 'WEBSITE SALES'), ('Ktda', 'KTDA Shop'),
+           ('Hilton', 'HILTON'), ('Busia', 'BUSIA'), ('Kisumu', 'KISUMU'), ('Thika', 'THIKA'),
+           ('Hazina', 'HAZINA'), ('Mombasa', 'MOMBASA'), ('Uganda', 'UGANDA'),
+           ('Starmall', 'STARMALL'), ('Nanyuki', 'NANYUKI'), ('Nyeri', 'NYERI'), ('Nakuru', 'NAKURU'),
+           ('Eldoret', 'ELDORET'), ('Rongai', 'RONGAI'), ('Kisii', 'KISII'),
+           ('Kakamega', 'KAKAMEGA'), ('Kitengela', 'KITENGELA'), ('Meru', 'MERU'),
+           -- The corporate team's own target (target_scope 'corporate').
+           ('Corporate', 'CORPORATE')
+)
+SELECT m.location AS "Location", t.period AS "Kind", t.start_date AS "Starts",
+       t.end_date AS "Ends", SUM(t.target_amount) AS "Target"
+FROM sales_pos_target t
+JOIN mapping m ON t.name ILIKE m.target_branch || '%'
+WHERE t.start_date <= CAST(:end_date AS DATE) AND t.end_date >= CAST(:start_date AS DATE)
+GROUP BY 1, 2, 3, 4
+"""
+
+
+# Every combo sold: one row per location, combo and day, from the combo
+# container line (the one carrying the price; the bags inside are their own
+# zero-priced lines). Refunds are folded into the sale they reverse.
+# "First Sold" is the combo's first sale ever, so a made-to-order combo
+# created for one customer can be told from a running one.
+COMBO_SALES = """
+WITH refunded AS (
+    SELECT r.refunded_orderline_id AS line_id,
+           SUM(r.qty) AS qty, SUM(r.price_subtotal_incl) AS amount
+    FROM pos_order_line r
+    WHERE r.refunded_orderline_id IS NOT NULL
+    GROUP BY r.refunded_orderline_id
+),
+combo_lines AS (
+    SELECT po.date_order::DATE AS sale_date, pt.id AS tmpl_id, pt.name AS combo,
+           CASE
+               WHEN lower(pconf.name) IN ('website sales', 'website', 'jumia') OR po.session_id IS NULL
+                   THEN 'Website'
+               WHEN lower(pconf.name) = 'staff pos' THEN 'Staff POS'
+               WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%' THEN 'Sinza'
+               ELSE INITCAP(TRIM(REGEXP_REPLACE(
+                       COALESCE(sw.name, sl.complete_name, 'N/A'), '\\s*Shop\\s*', '', 'gi')))
+           END AS location,
+           pol.qty + COALESCE(ref.qty, 0) AS qty,
+           (pol.price_subtotal_incl + COALESCE(ref.amount, 0))
+               / COALESCE(NULLIF(po.currency_rate, 0), 1) AS total,
+           po.id AS order_id
+    FROM pos_order po
+    JOIN pos_order_line           pol   ON pol.order_id = po.id
+    JOIN product_product          pp    ON pp.id = pol.product_id
+    JOIN product_template         pt    ON pt.id = pp.product_tmpl_id
+    LEFT JOIN refunded            ref   ON ref.line_id = pol.id
+    LEFT JOIN pos_session         ps    ON ps.id = po.session_id
+    LEFT JOIN pos_config          pconf ON pconf.id = ps.config_id
+    LEFT JOIN stock_picking_type  spt   ON spt.id = pconf.picking_type_id
+    LEFT JOIN stock_warehouse     sw    ON sw.id = spt.warehouse_id
+    LEFT JOIN stock_location      sl    ON sl.id = spt.default_location_src_id
+    WHERE po.state IN ('done', 'paid', 'invoiced')
+      AND pol.qty > 0
+      AND (COALESCE(pol.is_combo_line, FALSE) OR COALESCE(pt.is_combo, FALSE))
+),
+first_sale AS (
+    SELECT tmpl_id, MIN(sale_date) AS first_sold FROM combo_lines GROUP BY tmpl_id
+)
+SELECT c.sale_date AS "Date", c.location AS "Location", c.combo AS "Combo",
+       SUM(c.qty) AS "Bundles", ROUND(SUM(c.total)::NUMERIC, 2) AS "Revenue",
+       COUNT(DISTINCT c.order_id) AS "Orders", f.first_sold AS "First Sold"
+FROM combo_lines c
+JOIN first_sale f ON f.tmpl_id = c.tmpl_id
+WHERE c.sale_date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+GROUP BY 1, 2, 3, 7
+HAVING SUM(c.qty) > 0
+ORDER BY 1 DESC, 2, 3
+"""
+
+
+# Every order with a customer in the range, with the phone exactly as saved
+# and who served it, for checking phone numbers (lib/phones.py). One row per
+# order; refunds left out.
+CUSTOMER_PHONES = """
+SELECT
+    po.date_order::DATE                                              AS "Date",
+    CASE
+        WHEN lower(pconf.name) IN ('website sales', 'website', 'jumia') OR po.session_id IS NULL
+            THEN 'Website'
+        WHEN lower(pconf.name) = 'staff pos'
+            THEN 'Staff POS'
+        WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%'
+            THEN 'Sinza'
+        ELSE INITCAP(TRIM(REGEXP_REPLACE(
+                COALESCE(sw.name, sl.complete_name, pconf.name, 'N/A'),
+                '\s*Shop\s*', '', 'gi')))
+    END                                                              AS "Location",
+    COALESCE(NULLIF(TRIM(att_p.name), ''), NULLIF(TRIM(ba.name), ''),
+             'Not recorded')                                         AS "Served By",
+    rp.id                                                            AS "Customer ID",
+    rp.name                                                          AS "Raw Name",
+    COALESCE(rp.phone, '')                                           AS "Phone as Saved",
+    po.name                                                          AS "Order"
+FROM pos_order po
+JOIN res_partner               rp     ON rp.id = po.partner_id
+LEFT JOIN pos_session          ps     ON ps.id = po.session_id
+LEFT JOIN pos_config           pconf  ON pconf.id = ps.config_id
+LEFT JOIN stock_picking_type   spt    ON spt.id = pconf.picking_type_id
+LEFT JOIN stock_warehouse      sw     ON sw.id = spt.warehouse_id
+LEFT JOIN stock_location       sl     ON sl.id = spt.default_location_src_id
+LEFT JOIN res_users            att    ON att.id = po.attendant_id
+LEFT JOIN res_partner          att_p  ON att_p.id = att.partner_id
+LEFT JOIN pos_shop_ba          ba     ON ba.id = po.ba_id
+WHERE po.state IN ('done', 'paid', 'invoiced')
+  AND po.amount_total > 0
+  AND po.date_order >= CAST(:start_date AS TIMESTAMP)
+  AND po.date_order < CAST(:end_date AS TIMESTAMP) + INTERVAL '1 day'
+"""
+
+
+# Walk-in leads (the Leads module, denri.lead): a customer who asked for a bag
+# the shop could not sell them there and then — out of stock, waiting for an
+# offer, coming back later — captured with the bag wanted so the branch can
+# follow up. One row per active lead captured in the range. Status labels are
+# the module's own; "Stage" is its grouping of them (Won, Working, Waiting on Stock/Offer…).
+# Leads dated after today are left out: a few imported rows carry typo'd
+# future dates (December 2026).
+WALKIN_LEADS = """
+SELECT
+    l.id                                                            AS "ID",
+    l.reference                                                     AS "Reference",
+    -- Shops enter a day's leads the next morning, so the lead belongs to the
+    -- day before it was captured: that is its Date, the visit day.
+    l.capture_date - 1                                              AS "Date",
+    l.capture_date                                                  AS "Captured On",
+    CASE
+        WHEN b.code = 'websitesales' THEN 'Website'
+        WHEN b.code = 'daresalam'    THEN 'Sinza'
+        WHEN b.code = 'ktdashop'     THEN 'Ktda'
+        WHEN b.code = 'staffpos'     THEN 'Staff POS'
+        ELSE COALESCE(INITCAP(b.name), 'Not recorded')
+    END                                                             AS "Branch",
+    COALESCE(NULLIF(TRIM(l.collected_by), ''), NULLIF(TRIM(l.attendant_text), ''),
+             att_p.name, 'Not recorded')                            AS "Attendant",
+    INITCAP(NULLIF(TRIM(l.customer_name), ''))                      AS "Name",
+    NULLIF(TRIM(l.phone), '')                                       AS "Contact",
+    COALESCE(st.name, pt.name, INITCAP(NULLIF(TRIM(l.product_text), '')),
+             'Not recorded')                                        AS "Bag Wanted",
+    COALESCE(c.name, INITCAP(NULLIF(TRIM(l.colour_text), '')))      AS "Colour",
+    COALESCE(l.on_offer, FALSE)                                     AS "On Offer",
+    CASE l.contact_method
+        WHEN 'walk_in'       THEN 'Walk-in'
+        WHEN 'call'          THEN 'Call'
+        WHEN 'whatsapp'      THEN 'WhatsApp'
+        WHEN 'sms'           THEN 'SMS'
+        WHEN 'call_whatsapp' THEN 'Call + WhatsApp'
+        WHEN 'call_sms'      THEN 'Call + SMS'
+        WHEN 'online'        THEN 'Online'
+        WHEN 'instagram'     THEN 'Instagram'
+        WHEN 'facebook'      THEN 'Facebook'
+        ELSE 'Not recorded'
+    END                                                             AS "Contact Method",
+    CASE l.state
+        WHEN 'needs_status'   THEN 'Needs a Status'
+        WHEN 'new'            THEN 'Not Yet Contacted'
+        WHEN 'awaiting_reply' THEN 'Awaiting Reply'
+        WHEN 'followup'       THEN 'Follow Up Later'
+        WHEN 'will_visit'     THEN 'Will Visit Shop'
+        WHEN 'awaiting_stock' THEN 'Awaiting Stock'
+        WHEN 'awaiting_offer' THEN 'Awaiting Offer'
+        WHEN 'purchased'      THEN 'Purchased'
+        WHEN 'unreachable'    THEN 'Not Reachable'
+        WHEN 'not_interested' THEN 'Not Interested'
+        WHEN 'wrong_number'   THEN 'Wrong Number'
+        ELSE COALESCE(l.state, 'Needs a Status')
+    END                                                             AS "Status",
+    CASE l.state_kind
+        WHEN 'won'   THEN 'Won'
+        WHEN 'work'  THEN 'Working'
+        WHEN 'block' THEN 'Waiting on Stock/Offer'  -- the module's "Blocked"
+        WHEN 'new'   THEN 'New'
+        WHEN 'lost'  THEN 'Lost'
+        ELSE 'No Status'
+    END                                                             AS "Stage",
+    l.state = 'purchased'                                           AS "Converted",
+    COALESCE(l.amount_paid, 0)                                      AS "Amount Paid",
+    l.bought_what_asked                                             AS "Bought What Asked",
+    l.pos_reference                                                 AS "Receipt",
+    LEAST(l.followup_date, COALESCE(l.followup2_date, l.followup_date))
+                                                                    AS "Follow-up Date",
+    NULLIF(TRIM(l.notes), '')                                       AS "Note"
+FROM denri_lead l
+LEFT JOIN denri_lead_branch  b     ON b.id = l.branch_id
+LEFT JOIN denri_lead_style   st    ON st.id = l.style_id
+LEFT JOIN denri_lead_colour  c     ON c.id = l.colour_id
+LEFT JOIN product_product    pp    ON pp.id = l.product_id
+LEFT JOIN product_template   pt    ON pt.id = pp.product_tmpl_id
+LEFT JOIN res_users          att   ON att.id = l.attendant_id
+LEFT JOIN res_partner        att_p ON att_p.id = att.partner_id
+WHERE l.active
+  AND l.capture_date - 1 BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+  AND l.capture_date <= CURRENT_DATE
+ORDER BY l.capture_date DESC, l.id DESC
+"""
+
+
+# ---------------------------------------------------------------------------
+# Stock prediction & movement (lib/stock_planning.py).
+#
+# Bags only: product categories under "Bags /", clothing and combo products
+# left out (a combo is stocked as the bags inside it). Every bag on hand is
+# put in one bucket:
+#   Shop       — on a shop's own shelves (<code>/Stock…), named as the sales
+#                queries name the shop;
+#   Transit    — dispatched from the finishing warehouse and on its way to a
+#                shop (FINWH/Goods in Transit/<shop>);
+#   Warehouse  — finished and ready to send: the Validation Warehouse (VLD)
+#                and the Nairobi CBD Warehouse that feeds the town shops;
+#   Production — cut and being made up (Cut Bag Store, CBS).
+# ---------------------------------------------------------------------------
+STOCK_POSITION = r"""
+WITH shops AS (
+    SELECT sw.code,
+           CASE sw.code WHEN 'DAR' THEN 'Sinza'
+                ELSE INITCAP(TRIM(REGEXP_REPLACE(sw.name, '\s*Shop\s*', '', 'gi'))) END AS shop
+    FROM stock_warehouse sw
+    WHERE sw.code IN ('STAR','HAZ','MSA','NAKS','ELD','KSM','MERU','THK','KITE','WEB','NAN',
+                      'KAK','HTN','DAR','UG','KSI','KTDA','BUSIA','RONG')
+),
+placed AS (
+    SELECT sq.product_id, sq.quantity,
+        CASE
+            WHEN s.code IS NOT NULL AND sl.complete_name ILIKE s.code || '/Stock%' THEN 'Shop'
+            WHEN sl.complete_name ILIKE 'FINWH/Goods in Transit/CBD STOCKS%'    THEN 'Warehouse'
+            WHEN sl.complete_name ILIKE 'FINWH/Goods in Transit/%'               THEN 'Transit'
+            WHEN sl.complete_name ILIKE 'VLD/Stock%'
+              OR sl.complete_name ILIKE 'VLD/Dispatch Staging%'
+              OR sl.complete_name ILIKE 'CBD/Stock%'                             THEN 'Warehouse'
+            WHEN sl.complete_name ILIKE 'CBS/Stock%'                             THEN 'Production'
+        END AS bucket,
+        CASE
+            WHEN s.code IS NOT NULL THEN s.shop
+            WHEN sl.complete_name ILIKE 'FINWH/Goods in Transit/%' THEN
+                CASE UPPER(split_part(sl.complete_name, '/', 3))
+                    WHEN 'DAR-ES-ALAM'   THEN 'Sinza'
+                    WHEN 'KTDA SHOP'     THEN 'Ktda'
+                    WHEN 'WEBSITE SALES' THEN 'Website'
+                    ELSE INITCAP(TRIM(REGEXP_REPLACE(split_part(sl.complete_name, '/', 3),
+                                                     '\s*Shop\s*', '', 'gi')))
+                END
+        END AS location
+    FROM stock_quant sq
+    JOIN stock_location sl ON sl.id = sq.location_id
+    LEFT JOIN shops s ON s.code = split_part(sl.complete_name, '/', 1)
+    WHERE sl.usage = 'internal'
+)
+SELECT p.bucket AS "Bucket", COALESCE(p.location, '') AS "Location",
+       p.product_id AS "Product ID", pt.name AS "SKU", pc.name AS "Category",
+       SUM(p.quantity) AS "Qty"
+FROM placed p
+JOIN product_product  pp ON pp.id = p.product_id
+JOIN product_template pt ON pt.id = pp.product_tmpl_id
+JOIN product_category pc ON pc.id = pt.categ_id
+WHERE p.bucket IS NOT NULL
+  AND pc.complete_name ILIKE 'Bags /%' AND pc.complete_name NOT ILIKE '%Clothing%'
+  AND NOT COALESCE(pt.is_combo, FALSE)
+  AND NOT (p.bucket = 'Transit' AND p.location IN ('Marketing', 'Complimentary'))
+GROUP BY 1, 2, 3, 4, 5
+HAVING SUM(p.quantity) <> 0
+"""
+
+# Bags sold per shop and SKU over the last 90 days, net of refunds, with the
+# last 30 days and the month to date alongside, for the moving averages.
+# Bags sold inside a combo count as sales of that bag. Staff POS and flash
+# sales are left out: neither sells from a shop's own stock.
+STOCK_DEMAND = r"""
+WITH refunded AS (
+    SELECT r.refunded_orderline_id AS line_id, SUM(r.qty) AS qty
+    FROM pos_order_line r
+    WHERE r.refunded_orderline_id IS NOT NULL
+    GROUP BY r.refunded_orderline_id
+),
+lines AS (
+    SELECT
+        CASE
+            WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%' THEN 'Sinza'
+            ELSE INITCAP(TRIM(REGEXP_REPLACE(COALESCE(sw.name, sl.complete_name, 'N/A'),
+                                             '\s*Shop\s*', '', 'gi')))
+        END AS location,
+        pol.product_id, pt.name AS sku, pc.name AS category,
+        po.date_order::DATE AS sold_on,
+        pol.qty + COALESCE(ref.qty, 0) AS qty
+    FROM pos_order po
+    JOIN pos_order_line            pol   ON pol.order_id = po.id
+    LEFT JOIN refunded             ref   ON ref.line_id = pol.id
+    JOIN product_product           pp    ON pp.id = pol.product_id
+    JOIN product_template          pt    ON pt.id = pp.product_tmpl_id
+    JOIN product_category          pc    ON pc.id = pt.categ_id
+    LEFT JOIN pos_session          ps    ON ps.id = po.session_id
+    LEFT JOIN pos_config           pconf ON pconf.id = ps.config_id
+    LEFT JOIN stock_picking_type   spt   ON spt.id = pconf.picking_type_id
+    LEFT JOIN stock_warehouse      sw    ON sw.id = spt.warehouse_id
+    LEFT JOIN stock_location       sl    ON sl.id = spt.default_location_src_id
+    WHERE po.state IN ('done', 'paid', 'invoiced')
+      AND pol.qty > 0
+      AND po.date_order >= CURRENT_DATE - INTERVAL '90 days'
+      AND pc.complete_name ILIKE 'Bags /%' AND pc.complete_name NOT ILIKE '%Clothing%'
+      AND NOT COALESCE(pol.is_combo_line, FALSE) AND NOT COALESCE(pt.is_combo, FALSE)
+      AND COALESCE(lower(pconf.name), '') <> 'staff pos'
+      AND COALESCE(sw.name, sl.complete_name, '') NOT ILIKE '%Accessories%'
+      AND COALESCE(sw.name, sl.complete_name, '') NOT ILIKE '%Flash Sale%'
+)
+SELECT location AS "Location", product_id AS "Product ID", sku AS "SKU",
+       category AS "Category",
+       SUM(qty)                                                             AS "Sold 90d",
+       COALESCE(SUM(qty) FILTER (WHERE sold_on >= CURRENT_DATE - 30), 0)    AS "Sold 30d",
+       COALESCE(SUM(qty) FILTER (
+           WHERE sold_on >= DATE_TRUNC('month', CURRENT_DATE)), 0)          AS "Sold MTD",
+       MAX(sold_on)                                                         AS "Last Sold"
+FROM lines
+GROUP BY 1, 2, 3, 4
+HAVING SUM(qty) > 0
+"""
+
+# Monthly bag targets (target_qty) per shop for last, this and next month,
+# as the Sales page names the shops.
+STOCK_TARGETS = """
+WITH mapping(location, target_branch) AS (
+    VALUES ('Sinza', 'DAR-ES-ALAM'), ('Website', 'WEBSITE SALES'), ('Ktda', 'KTDA Shop'),
+           ('Hilton', 'HILTON'), ('Busia', 'BUSIA'), ('Kisumu', 'KISUMU'), ('Thika', 'THIKA'),
+           ('Hazina', 'HAZINA'), ('Mombasa', 'MOMBASA'), ('Uganda', 'UGANDA'),
+           ('Starmall', 'STARMALL'), ('Nanyuki', 'NANYUKI'), ('Nyeri', 'NYERI'), ('Nakuru', 'NAKURU'),
+           ('Eldoret', 'ELDORET'), ('Rongai', 'RONGAI'), ('Kisii', 'KISII'),
+           ('Kakamega', 'KAKAMEGA'), ('Kitengela', 'KITENGELA'), ('Meru', 'MERU')
+)
+SELECT m.location AS "Location", DATE_TRUNC('month', t.start_date)::DATE AS "Month",
+       SUM(t.target_qty) AS "Target Bags"
+FROM sales_pos_target t
+JOIN mapping m ON t.name ILIKE m.target_branch || '%'
+WHERE t.period = 'month'
+  AND t.start_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month'
+  AND t.start_date <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '2 months'
+GROUP BY 1, 2
+"""
+
+# Daily bags sold over the last 180 days for a set of SKUs (one bag's
+# colours), network-wide or at one shop, for the moving-average chart.
+STOCK_DAILY_SALES = r"""
+WITH refunded AS (
+    SELECT r.refunded_orderline_id AS line_id, SUM(r.qty) AS qty
+    FROM pos_order_line r
+    WHERE r.refunded_orderline_id IS NOT NULL
+    GROUP BY r.refunded_orderline_id
+)
+SELECT po.date_order::DATE AS "Date",
+       SUM(pol.qty + COALESCE(ref.qty, 0)) AS "Sold"
+FROM pos_order po
+JOIN pos_order_line            pol   ON pol.order_id = po.id
+LEFT JOIN refunded             ref   ON ref.line_id = pol.id
+LEFT JOIN pos_session          ps    ON ps.id = po.session_id
+LEFT JOIN pos_config           pconf ON pconf.id = ps.config_id
+LEFT JOIN stock_picking_type   spt   ON spt.id = pconf.picking_type_id
+LEFT JOIN stock_warehouse      sw    ON sw.id = spt.warehouse_id
+LEFT JOIN stock_location       sl    ON sl.id = spt.default_location_src_id
+WHERE po.state IN ('done', 'paid', 'invoiced')
+  AND pol.qty > 0
+  AND po.date_order >= CURRENT_DATE - INTERVAL '180 days'
+  AND pol.product_id = ANY(CAST(:product_ids AS INT[]))
+  AND NOT COALESCE(pol.is_combo_line, FALSE)
+  AND COALESCE(lower(pconf.name), '') <> 'staff pos'
+  AND (CAST(:location AS TEXT) = ''
+       OR CASE
+              WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%' THEN 'Sinza'
+              ELSE INITCAP(TRIM(REGEXP_REPLACE(COALESCE(sw.name, sl.complete_name, 'N/A'),
+                                               '\s*Shop\s*', '', 'gi')))
+          END = CAST(:location AS TEXT))
+GROUP BY 1
+ORDER BY 1
+"""
+
+
+# Score cards (Shop Attendants page): one row per order in the range with
+# its revenue, bags, customer and whoever served it.
+#   Revenue  — every line except delivery fees, in KES at the order's own
+#              rate, net of what was later refunded against it (like the
+#              Sales page);
+#   Bags     — bags and gift bags, bags inside a combo counted, the combo
+#              line itself not;
+#   Corporate — the customer is recorded as Corporate (res_partner.gender);
+#   Customer — the last nine digits of the phone, else the partner record,
+#              so one person under two records is still one customer.
+# Repeat purchase and retention are worked out from these rows in
+# lib/scorecards.py (distinct purchase days; this period against the last).
+SCORECARD_ORDERS = r"""
+WITH refunded AS (
+    SELECT r.refunded_orderline_id AS line_id,
+           SUM(r.qty) AS qty, SUM(r.price_subtotal_incl) AS amount
+    FROM pos_order_line r
+    WHERE r.refunded_orderline_id IS NOT NULL
+    GROUP BY r.refunded_orderline_id
+),
+customer_key AS (
+    SELECT rp.id AS partner_id,
+           CASE WHEN LENGTH(REGEXP_REPLACE(COALESCE(rp.phone, rp.mobile, ''), '[^0-9]', '', 'g')) >= 9
+                THEN RIGHT(REGEXP_REPLACE(COALESCE(rp.phone, rp.mobile, ''), '[^0-9]', '', 'g'), 9)
+                ELSE 'partner:' || rp.id END AS key,
+           LOWER(TRIM(COALESCE(rp.gender, ''))) = 'corporate' AS corporate
+    FROM res_partner rp
+),
+orders AS (
+    SELECT
+        po.id, po.date_order, po.date_order::DATE AS sale_date, po.partner_id,
+        CASE
+            WHEN lower(pconf.name) IN ('website sales', 'website', 'jumia') OR po.session_id IS NULL
+                THEN 'Website'
+            WHEN lower(pconf.name) = 'staff pos' THEN 'Staff POS'
+            WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%' THEN 'Sinza'
+            ELSE INITCAP(TRIM(REGEXP_REPLACE(
+                    COALESCE(sw.name, sl.complete_name, pconf.name, 'N/A'), '\s*Shop\s*', '', 'gi')))
+        END AS location,
+        CASE WHEN NULLIF(TRIM(ba.name), '') IS NOT NULL THEN TRIM(ba.name) || ' (BA)'
+             ELSE COALESCE(NULLIF(TRIM(att_p.name), ''), 'Not recorded') END AS person,
+        COALESCE(NULLIF(po.currency_rate, 0), 1) AS rate
+    FROM pos_order po
+    LEFT JOIN pos_session          ps     ON ps.id = po.session_id
+    LEFT JOIN pos_config           pconf  ON pconf.id = ps.config_id
+    LEFT JOIN stock_picking_type   spt    ON spt.id = pconf.picking_type_id
+    LEFT JOIN stock_warehouse      sw     ON sw.id = spt.warehouse_id
+    LEFT JOIN stock_location       sl     ON sl.id = spt.default_location_src_id
+    LEFT JOIN res_users            att    ON att.id = po.attendant_id
+    LEFT JOIN res_partner          att_p  ON att_p.id = att.partner_id
+    LEFT JOIN pos_shop_ba          ba     ON ba.id = po.ba_id
+    WHERE po.state IN ('done', 'paid', 'invoiced')
+      AND po.date_order >= CAST(:start_date AS TIMESTAMP)
+      AND po.date_order < CAST(:end_date AS TIMESTAMP) + INTERVAL '1 day'
+),
+totals AS (
+    SELECT o.id,
+           SUM(CASE WHEN pt.name NOT ILIKE '%Delivery Fee%'
+                    THEN pol.price_subtotal_incl + COALESCE(ref.amount, 0) ELSE 0 END) / MAX(o.rate)
+                                                                    AS revenue,
+           SUM(CASE WHEN (pc.complete_name ILIKE 'Bags%' OR pt.name ILIKE '%Gift Bag%')
+                     AND NOT COALESCE(pol.is_combo_line, FALSE) AND NOT COALESCE(pt.is_combo, FALSE)
+                    THEN pol.qty + COALESCE(ref.qty, 0) ELSE 0 END) AS bags
+    FROM orders o
+    JOIN pos_order_line       pol ON pol.order_id = o.id
+    LEFT JOIN refunded        ref ON ref.line_id = pol.id
+    JOIN product_product      pp  ON pp.id = pol.product_id
+    JOIN product_template     pt  ON pt.id = pp.product_tmpl_id
+    LEFT JOIN product_category pc ON pc.id = pt.categ_id
+    WHERE pol.qty > 0
+    GROUP BY o.id
+),
+keyed AS (
+    SELECT o.*, ck.key, COALESCE(ck.corporate, FALSE) AS corporate
+    FROM orders o LEFT JOIN customer_key ck ON ck.partner_id = o.partner_id
+)
+SELECT k.id AS "Order ID", k.sale_date AS "Date", k.location AS "Location",
+       k.person AS "Served By", k.key AS "Customer", k.partner_id AS "Partner",
+       k.corporate AS "Corporate",
+       ROUND(t.revenue::NUMERIC, 2) AS "Revenue", t.bags AS "Bags",
+       -- For matching feedback forms to the sale they came from: the sale's
+       -- local time and the customer's name.
+       (k.date_order AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Nairobi') AS "Time",
+       NULLIF(TRIM(rp.name), '') AS "Customer Name"
+FROM keyed k
+JOIN totals t ON t.id = k.id
+LEFT JOIN res_partner rp ON rp.id = k.partner_id
+WHERE t.revenue > 0
+"""
+
+
+# Bags sold per shop and SKU between two dates, counted as STOCK_DEMAND
+# counts them — for Top Sellers over a custom period.
+STOCK_SOLD_RANGE = r"""
+WITH refunded AS (
+    SELECT r.refunded_orderline_id AS line_id, SUM(r.qty) AS qty
+    FROM pos_order_line r
+    WHERE r.refunded_orderline_id IS NOT NULL
+    GROUP BY r.refunded_orderline_id
+)
+SELECT
+    CASE
+        WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%' THEN 'Sinza'
+        ELSE INITCAP(TRIM(REGEXP_REPLACE(COALESCE(sw.name, sl.complete_name, 'N/A'),
+                                         '\s*Shop\s*', '', 'gi')))
+    END                                    AS "Location",
+    pol.product_id                         AS "Product ID",
+    pt.name                                AS "SKU",
+    pc.name                                AS "Category",
+    SUM(pol.qty + COALESCE(ref.qty, 0))    AS "Sold"
+FROM pos_order po
+JOIN pos_order_line            pol   ON pol.order_id = po.id
+LEFT JOIN refunded             ref   ON ref.line_id = pol.id
+JOIN product_product           pp    ON pp.id = pol.product_id
+JOIN product_template          pt    ON pt.id = pp.product_tmpl_id
+JOIN product_category          pc    ON pc.id = pt.categ_id
+LEFT JOIN pos_session          ps    ON ps.id = po.session_id
+LEFT JOIN pos_config           pconf ON pconf.id = ps.config_id
+LEFT JOIN stock_picking_type   spt   ON spt.id = pconf.picking_type_id
+LEFT JOIN stock_warehouse      sw    ON sw.id = spt.warehouse_id
+LEFT JOIN stock_location       sl    ON sl.id = spt.default_location_src_id
+WHERE po.state IN ('done', 'paid', 'invoiced')
+  AND pol.qty > 0
+  AND po.date_order >= CAST(:start_date AS TIMESTAMP)
+  AND po.date_order < CAST(:end_date AS TIMESTAMP) + INTERVAL '1 day'
+  AND pc.complete_name ILIKE 'Bags /%' AND pc.complete_name NOT ILIKE '%Clothing%'
+  AND NOT COALESCE(pol.is_combo_line, FALSE) AND NOT COALESCE(pt.is_combo, FALSE)
+  AND COALESCE(lower(pconf.name), '') <> 'staff pos'
+  AND COALESCE(sw.name, sl.complete_name, '') NOT ILIKE '%Accessories%'
+  AND COALESCE(sw.name, sl.complete_name, '') NOT ILIKE '%Flash Sale%'
+GROUP BY 1, 2, 3, 4
+HAVING SUM(pol.qty + COALESCE(ref.qty, 0)) > 0
+"""
+
+
+# Corporate sales, line by line, from both places they are made:
+#   Corporate Sales — the corporate team's jobs (work orders, CO-…) in the
+#                     corporate app, dated by order, with their products;
+#   Shop Corporate  — till orders at the shops for customers recorded as
+#                     Corporate (res_partner.gender), refunds netted.
+# Revenue is in KES, VAT included like the Sales page, delivery fees out; a
+# job's line is valued at its quantity times its unit price. Bags leaves out
+# a job's charges (logo origination, customization).
+CORPORATE_LINES = r"""
+WITH refunded AS (
+    SELECT r.refunded_orderline_id AS line_id,
+           SUM(r.qty) AS qty, SUM(r.price_subtotal_incl) AS amount
+    FROM pos_order_line r
+    WHERE r.refunded_orderline_id IS NOT NULL
+    GROUP BY r.refunded_orderline_id
+)
+SELECT
+    'Corporate Sales'                                               AS "Channel",
+    w.date_order                                                    AS "Date",
+    w.name                                                          AS "Order",
+    COALESCE(NULLIF(TRIM(w.company), ''), 'Not recorded')           AS "Customer",
+    ''                                                              AS "Phone",
+    'Corporate'                                                     AS "Location",
+    COALESCE(sp.name, 'Not recorded')                               AS "Sold By",
+    COALESCE(NULLIF(TRIM(l.product), ''), 'Not recorded')           AS "Product",
+    'Corporate Job'                                                 AS "Category",
+    l.qty                                                           AS "Qty",
+    CASE WHEN l.product ILIKE '%fee%' OR l.product ILIKE '%logo%'
+              OR l.product ILIKE '%origination%' OR l.product ILIKE '%branding%'
+         THEN 0 ELSE l.qty END                                      AS "Bags",
+    l.qty * l.price_unit                                            AS "Revenue"
+FROM denri_corporate_workorder w
+JOIN denri_corporate_workorder_line l ON l.workorder_id = w.id
+LEFT JOIN res_users   u  ON u.id = w.user_id
+LEFT JOIN res_partner sp ON sp.id = u.partner_id
+WHERE COALESCE(w.stage, '') NOT IN ('cancel', 'cancelled')
+  AND w.date_order BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+
+UNION ALL
+
+SELECT
+    'Shop Corporate',
+    po.date_order::DATE,
+    po.name,
+    COALESCE(NULLIF(TRIM(cust.name), ''), 'Not recorded'),
+    COALESCE(cust.phone, cust.mobile, ''),
+    CASE
+        WHEN lower(pconf.name) IN ('website sales', 'website', 'jumia') OR po.session_id IS NULL
+            THEN 'Website'
+        WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%' THEN 'Sinza'
+        ELSE INITCAP(TRIM(REGEXP_REPLACE(
+                COALESCE(sw.name, sl.complete_name, pconf.name, 'N/A'), '\s*Shop\s*', '', 'gi')))
+    END,
+    CASE WHEN NULLIF(TRIM(ba.name), '') IS NOT NULL THEN TRIM(ba.name) || ' (BA)'
+         ELSE COALESCE(NULLIF(TRIM(att_p.name), ''), 'Not recorded') END,
+    pt.name,
+    COALESCE(pc.name, ''),
+    pol.qty + COALESCE(ref.qty, 0),
+    CASE WHEN (pc.complete_name ILIKE 'Bags%' OR pt.name ILIKE '%Gift Bag%')
+              AND NOT COALESCE(pol.is_combo_line, FALSE) AND NOT COALESCE(pt.is_combo, FALSE)
+         THEN pol.qty + COALESCE(ref.qty, 0) ELSE 0 END,
+    CASE WHEN pt.name ILIKE '%Delivery Fee%' THEN 0
+         ELSE (pol.price_subtotal_incl + COALESCE(ref.amount, 0))
+              / COALESCE(NULLIF(po.currency_rate, 0), 1) END
+FROM pos_order po
+JOIN res_partner               cust   ON cust.id = po.partner_id
+JOIN pos_order_line            pol    ON pol.order_id = po.id
+LEFT JOIN refunded             ref    ON ref.line_id = pol.id
+LEFT JOIN product_product      pp     ON pp.id = pol.product_id
+LEFT JOIN product_template     pt     ON pt.id = pp.product_tmpl_id
+LEFT JOIN product_category     pc     ON pc.id = pt.categ_id
+LEFT JOIN pos_session          ps     ON ps.id = po.session_id
+LEFT JOIN pos_config           pconf  ON pconf.id = ps.config_id
+LEFT JOIN stock_picking_type   spt    ON spt.id = pconf.picking_type_id
+LEFT JOIN stock_warehouse      sw     ON sw.id = spt.warehouse_id
+LEFT JOIN stock_location       sl     ON sl.id = spt.default_location_src_id
+LEFT JOIN res_users            att    ON att.id = po.attendant_id
+LEFT JOIN res_partner          att_p  ON att_p.id = att.partner_id
+LEFT JOIN pos_shop_ba          ba     ON ba.id = po.ba_id
+WHERE po.state IN ('done', 'paid', 'invoiced')
+  AND LOWER(TRIM(COALESCE(cust.gender, ''))) = 'corporate'
+  AND pol.qty > 0
+  AND NOT (pol.qty + COALESCE(ref.qty, 0) = 0
+           AND pol.price_subtotal_incl + COALESCE(ref.amount, 0) = 0)
+  AND po.date_order >= CAST(:start_date AS TIMESTAMP)
+  AND po.date_order < CAST(:end_date AS TIMESTAMP) + INTERVAL '1 day'
+"""
+
+# The corporate figures as Odoo's Sales & POS Dashboard shows them: revenue is
+# the payments received in the period on corporate invoices, orders is the
+# number of those payments, and quantity is everything on the corporate
+# jobs (work orders) dated in the period.
+CORPORATE_TOTALS = """
+SELECT
+    (SELECT COALESCE(SUM(p.amount), 0) FROM denri_corporate_payment p
+      WHERE p.date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)) AS "Revenue",
+    (SELECT COUNT(*) FROM denri_corporate_payment p
+      WHERE p.date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)) AS "Payments",
+    (SELECT COALESCE(SUM(w.qty_total), 0) FROM denri_corporate_workorder w
+      WHERE COALESCE(w.stage, '') NOT IN ('cancel', 'cancelled')
+        AND w.date_order BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)) AS "Qty",
+    (SELECT COUNT(*) FROM denri_corporate_workorder w
+      WHERE COALESCE(w.stage, '') NOT IN ('cancel', 'cancelled')
+        AND w.date_order BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)) AS "Jobs"
+"""
+
+# Corporate quotations still in draft, for the pipeline.
+CORPORATE_QUOTATIONS = """
+SELECT q.date_quote AS "Date", q.name AS "Quotation",
+       COALESCE(NULLIF(TRIM(q.company), ''), 'Not recorded') AS "Customer",
+       COALESCE(sp.name, 'Not recorded') AS "Sold By",
+       INITCAP(q.status) AS "Status",
+       q.date_quote + COALESCE(q.validity_days, 0) AS "Valid Until",
+       ROUND(q.amount_total::NUMERIC, 2) AS "Value"
+FROM denri_corporate_quote q
+LEFT JOIN res_users   u  ON u.id = q.user_id
+LEFT JOIN res_partner sp ON sp.id = u.partner_id
+WHERE q.status = 'draft'
+  AND q.date_quote BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+ORDER BY q.date_quote DESC
+"""
+
+
+# Bags bought by a set of customers (last nine digits of the phone) from a
+# date on, at any shop or online — to see whether out-of-stock customers came
+# back and bought the bag they asked for.
+PURCHASES_BY_PHONE = r"""
+WITH buyers AS (
+    SELECT rp.id,
+           RIGHT(REGEXP_REPLACE(COALESCE(rp.phone, rp.mobile, ''), '[^0-9]', '', 'g'), 9) AS phone_key
+    FROM res_partner rp
+    WHERE RIGHT(REGEXP_REPLACE(COALESCE(rp.phone, rp.mobile, ''), '[^0-9]', '', 'g'), 9)
+          = ANY(CAST(:phone_keys AS TEXT[]))
+)
+SELECT b.phone_key AS "Phone Key", po.date_order::DATE AS "Bought On", po.name AS "Receipt",
+       pt.name AS "Product",
+       CASE
+           WHEN lower(pconf.name) IN ('website sales', 'website') OR po.session_id IS NULL THEN 'Website'
+           WHEN lower(pconf.name) = 'jumia' THEN 'Jumia'
+           WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%' THEN 'Sinza'
+           ELSE INITCAP(TRIM(REGEXP_REPLACE(
+                   COALESCE(sw.name, sl.complete_name, pconf.name, 'N/A'), '\s*Shop\s*', '', 'gi')))
+       END AS "Bought At"
+FROM buyers b
+JOIN pos_order po              ON po.partner_id = b.id
+JOIN pos_order_line pol        ON pol.order_id = po.id
+JOIN product_product pp        ON pp.id = pol.product_id
+JOIN product_template pt       ON pt.id = pp.product_tmpl_id
+JOIN product_category pc       ON pc.id = pt.categ_id
+LEFT JOIN pos_session ps       ON ps.id = po.session_id
+LEFT JOIN pos_config pconf     ON pconf.id = ps.config_id
+LEFT JOIN stock_picking_type spt ON spt.id = pconf.picking_type_id
+LEFT JOIN stock_warehouse sw   ON sw.id = spt.warehouse_id
+LEFT JOIN stock_location sl    ON sl.id = spt.default_location_src_id
+WHERE po.state IN ('done', 'paid', 'invoiced')
+  AND pol.qty > 0
+  AND po.date_order::DATE >= CAST(:from_date AS DATE)
+  AND pc.complete_name ILIKE 'Bags%'
+  AND NOT COALESCE(pol.is_combo_line, FALSE)
+"""
+
+
+# When each bag product was added to Odoo — for Runway Bags, the bag families
+# launched after Lafemme (Product Sales → New Products).
+BAG_TEMPLATE_DATES = """
+SELECT pt.name AS "Product", pt.create_date AS "Created", pc.name AS "Category"
+FROM product_template pt
+JOIN product_category pc ON pc.id = pt.categ_id
+WHERE pc.complete_name ILIKE 'Bags /%'
+  AND pc.complete_name NOT ILIKE '%Clothing%'
+  AND NOT COALESCE(pt.is_combo, FALSE)
+  AND pt.name NOT LIKE '%+%'
+"""
+
+
+# Every till order in the range with its customer, counted exactly as the
+# Sales page counts revenue (SALES_PERFORMANCE_BY_BRANCH): every line except
+# delivery and customization fees, in KES at the order's own rate, refunds as
+# the negative orders they are, every till including Staff POS and Jumia —
+# so the All Customers total agrees with the Sales page to the shilling.
+CUSTOMER_ORDERS = r"""
+SELECT
+    po.id                                                           AS "Order ID",
+    po.date_order::DATE                                             AS "Date",
+    CASE
+        WHEN lower(pconf.name) = 'jumia' THEN 'Jumia'
+        WHEN lower(pconf.name) IN ('website sales', 'website') OR po.session_id IS NULL THEN 'Website'
+        WHEN lower(pconf.name) = 'staff pos' THEN 'Staff POS'
+        WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%' THEN 'Sinza'
+        ELSE INITCAP(TRIM(REGEXP_REPLACE(
+                COALESCE(sw.name, sl.complete_name, 'N/A'), '\s*Shop\s*', '', 'gi')))
+    END                                                             AS "Location",
+    rp.name                                                         AS "Raw Name",
+    COALESCE(rp.phone, rp.mobile, '')                               AS "Phone",
+    LOWER(TRIM(COALESCE(rp.gender, ''))) = 'corporate'              AS "Corporate",
+    SUM(CASE WHEN pt.name NOT ILIKE '%Delivery Fee%' AND pt.name NOT ILIKE '%Customization Fee%'
+             THEN pol.price_subtotal_incl / COALESCE(NULLIF(po.currency_rate, 0), 1)
+             ELSE 0 END)                                            AS "Revenue",
+    SUM(CASE WHEN (COALESCE(pc.name, '') ILIKE 'Bags%' OR pt.name ILIKE '%Gift Bag%')
+              AND NOT COALESCE(pol.is_combo_line, FALSE) AND NOT COALESCE(pt.is_combo, FALSE)
+             THEN pol.qty ELSE 0 END)                               AS "Bags"
+FROM pos_order po
+JOIN pos_order_line            pol   ON pol.order_id = po.id
+JOIN product_product           pp    ON pp.id = pol.product_id
+JOIN product_template          pt    ON pt.id = pp.product_tmpl_id
+LEFT JOIN product_category     pc    ON pc.id = pt.categ_id
+LEFT JOIN res_partner          rp    ON rp.id = po.partner_id
+LEFT JOIN pos_session          ps    ON ps.id = po.session_id
+LEFT JOIN pos_config           pconf ON pconf.id = ps.config_id
+LEFT JOIN stock_picking_type   spt   ON spt.id = pconf.picking_type_id
+LEFT JOIN stock_warehouse      sw    ON sw.id = spt.warehouse_id
+LEFT JOIN stock_location       sl    ON sl.id = spt.default_location_src_id
+WHERE po.state IN ('done', 'paid', 'invoiced')
+  AND po.date_order >= CAST(:start_date AS TIMESTAMP)
+  AND po.date_order < CAST(:end_date AS TIMESTAMP) + INTERVAL '1 day'
+GROUP BY 1, 2, 3, 4, 5, 6
+"""
+
+# Payments received on corporate invoices in the range, by company — the
+# corporate revenue Odoo's Sales & POS Dashboard (and the Sales page) shows.
+CORPORATE_PAYMENTS = """
+SELECT p.date AS "Date", COALESCE(NULLIF(TRIM(i.company), ''), 'Not recorded') AS "Customer",
+       COALESCE(i.contact_phone, '') AS "Phone", i.name AS "Invoice", p.amount AS "Revenue"
+FROM denri_corporate_payment p
+JOIN denri_corporate_invoice i ON i.id = p.invoice_id
+WHERE p.date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+"""
+
+
+# Footfall (the Footfall module, denri.footfall.count): the visitors counted
+# at each shop each day, beside that shop's sales the same day, for the
+# Footfall Traffic page. Shops are the tills that have ever had a count;
+# a shop-day with sales but no count is kept (Visitors empty) so missing
+# counts show. Conversion uses walk-in orders: online orders do not come
+# through the door. Revenue is counted as on the Sales page.
+FOOTFALL_DAILY = r"""
+WITH shops AS (
+    SELECT DISTINCT config_id FROM denri_footfall_count
+),
+ff AS (
+    SELECT f.config_id, f.date, f.manual_count AS visitors,
+           NULLIF(TRIM(f.counted_by), '') AS counted_by, f.source
+    FROM denri_footfall_count f
+    WHERE f.date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+),
+orders AS (
+    -- Dated in Kenya time, as the POS dashboard dates them.
+    SELECT ps.config_id,
+           (po.date_order AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Nairobi')::DATE AS date,
+           po.id, po.customer_type,
+           SUM(CASE WHEN pt.name NOT ILIKE '%Delivery Fee%' AND pt.name NOT ILIKE '%Customization Fee%'
+                    THEN pol.price_subtotal_incl / COALESCE(NULLIF(po.currency_rate, 0), 1)
+                    ELSE 0 END) AS revenue
+    FROM pos_order po
+    JOIN pos_session      ps  ON ps.id = po.session_id
+    JOIN shops            s   ON s.config_id = ps.config_id
+    JOIN pos_order_line   pol ON pol.order_id = po.id
+    JOIN product_product  pp  ON pp.id = pol.product_id
+    JOIN product_template pt  ON pt.id = pp.product_tmpl_id
+    WHERE po.state IN ('done', 'paid', 'invoiced')
+      -- A day either side on the raw timestamp lets the date_order index
+      -- narrow the scan; the Kenya-time date below is the exact test.
+      AND po.date_order >= CAST(:start_date AS TIMESTAMP) - INTERVAL '1 day'
+      AND po.date_order < CAST(:end_date AS TIMESTAMP) + INTERVAL '2 days'
+      AND (po.date_order AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Nairobi')::DATE
+          BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+    GROUP BY 1, 2, 3, 4
+),
+sales AS (
+    SELECT config_id, date,
+           COUNT(*) FILTER (WHERE revenue > 0)                                     AS orders,
+           COUNT(*) FILTER (WHERE revenue > 0 AND customer_type = 'walkin')        AS walkin_orders,
+           COUNT(*) FILTER (WHERE revenue > 0 AND customer_type = 'online')        AS online_orders,
+           COUNT(*) FILTER (WHERE revenue > 0
+                              AND COALESCE(customer_type, '') NOT IN ('walkin', 'online')) AS other_orders,
+           COUNT(*) FILTER (WHERE revenue < 0)                                     AS refunds,
+           SUM(revenue)                                                            AS revenue,
+           SUM(revenue) FILTER (WHERE customer_type = 'walkin')                    AS walkin_revenue
+    FROM orders GROUP BY 1, 2
+)
+SELECT
+    COALESCE(ff.date, s.date)                                       AS "Date",
+    CASE pc.name WHEN 'KTDA Shop' THEN 'Ktda' WHEN 'DAR-ES-ALAM' THEN 'Sinza'
+                 ELSE INITCAP(TRIM(REGEXP_REPLACE(pc.name, '\s*Shop\s*', '', 'gi'))) END
+                                                                    AS "Location",
+    ff.visitors                                                     AS "Visitors",
+    ff.counted_by                                                   AS "Counted By",
+    CASE ff.source WHEN 'till' THEN 'At the till' WHEN 'workspace' THEN 'Workspace'
+                   WHEN 'import' THEN 'Imported' END                AS "Entered",
+    COALESCE(s.orders, 0)                                           AS "Orders",
+    COALESCE(s.walkin_orders, 0)                                    AS "Walk-in Orders",
+    COALESCE(s.online_orders, 0)                                    AS "Online Orders",
+    COALESCE(s.other_orders, 0)                                     AS "Other Orders",
+    COALESCE(s.refunds, 0)                                          AS "Refunds",
+    ROUND(COALESCE(s.revenue, 0)::NUMERIC, 2)                       AS "Revenue",
+    ROUND(COALESCE(s.walkin_revenue, 0)::NUMERIC, 2)                AS "Walk-in Revenue"
+FROM ff
+FULL OUTER JOIN sales s ON s.config_id = ff.config_id AND s.date = ff.date
+JOIN pos_config pc ON pc.id = COALESCE(ff.config_id, s.config_id)
+ORDER BY 1 DESC, 2
+"""
+
+
+# The Reports page (daily / weekly / monthly): every till order in the range
+# with its customer, gender, channel, revenue and bags — revenue counted as
+# the Sales page counts it (every line except delivery and customization
+# fees, KES at the order's rate, refunds as negative orders), so the report
+# agrees with the Sales page and Odoo's POS dashboard.
+REPORT_ORDERS = r"""
+SELECT
+    po.id                                                           AS "Order ID",
+    po.date_order::DATE                                             AS "Date",
+    CASE
+        WHEN lower(pconf.name) = 'jumia' THEN 'Jumia'
+        WHEN lower(pconf.name) IN ('website sales', 'website') OR po.session_id IS NULL THEN 'Website'
+        WHEN lower(pconf.name) = 'staff pos' THEN 'Staff POS'
+        WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%' THEN 'Sinza'
+        ELSE INITCAP(TRIM(REGEXP_REPLACE(
+                COALESCE(sw.name, sl.complete_name, 'N/A'), '\s*Shop\s*', '', 'gi')))
+    END                                                             AS "Location",
+    po.partner_id                                                   AS "Partner",
+    rp.name                                                         AS "Raw Name",
+    COALESCE(rp.phone, rp.mobile, '')                               AS "Phone",
+    COALESCE(INITCAP(NULLIF(TRIM(rp.gender), '')), 'Not recorded')  AS "Gender",
+    CASE po.customer_type WHEN 'walkin' THEN 'Walk-in' WHEN 'online' THEN 'Online'
+         WHEN 'activation' THEN 'Activation' WHEN 'employee' THEN 'Employee'
+         ELSE 'Not recorded' END                                    AS "Channel",
+    SUM(CASE WHEN pt.name NOT ILIKE '%Delivery Fee%' AND pt.name NOT ILIKE '%Customization Fee%'
+             THEN pol.price_subtotal_incl / COALESCE(NULLIF(po.currency_rate, 0), 1)
+             ELSE 0 END)                                            AS "Revenue",
+    SUM(CASE WHEN (COALESCE(pc.name, '') ILIKE 'Bags%' OR pt.name ILIKE '%Gift Bag%')
+              AND NOT COALESCE(pol.is_combo_line, FALSE) AND NOT COALESCE(pt.is_combo, FALSE)
+             THEN pol.qty ELSE 0 END)                               AS "Bags"
+FROM pos_order po
+JOIN pos_order_line            pol   ON pol.order_id = po.id
+JOIN product_product           pp    ON pp.id = pol.product_id
+JOIN product_template          pt    ON pt.id = pp.product_tmpl_id
+LEFT JOIN product_category     pc    ON pc.id = pt.categ_id
+LEFT JOIN res_partner          rp    ON rp.id = po.partner_id
+LEFT JOIN pos_session          ps    ON ps.id = po.session_id
+LEFT JOIN pos_config           pconf ON pconf.id = ps.config_id
+LEFT JOIN stock_picking_type   spt   ON spt.id = pconf.picking_type_id
+LEFT JOIN stock_warehouse      sw    ON sw.id = spt.warehouse_id
+LEFT JOIN stock_location       sl    ON sl.id = spt.default_location_src_id
+WHERE po.state IN ('done', 'paid', 'invoiced')
+  -- A range on the raw timestamp, not date_order::DATE BETWEEN …: the same
+  -- rows, but the date_order index can be used (a week: 5s instead of 15-24s,
+  -- and fewer reads long enough for the replica to cancel).
+  AND po.date_order >= CAST(:start_date AS TIMESTAMP)
+  AND po.date_order < CAST(:end_date AS TIMESTAMP) + INTERVAL '1 day'
+GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+"""
+
+
+# ------------------------------------------------- weighted score cards ---
+# Inputs for lib.weighted_scores: the shop heads, the day's role tags, shop
+# attendance, stock counts and bag lines — all read from the Shop Attendants
+# and stock-count modules.
+
+# Each shop's head (Shop Attendants app → shop → Head).
+SHOP_HEADS = """
+SELECT pc.name AS "Shop", p.name AS "Head"
+FROM pos_config pc
+JOIN res_users   u ON u.id = pc.head_user_id
+JOIN res_partner p ON p.id = u.partner_id
+WHERE pc.active
+"""
+
+# The role each attendant is tagged with (floor / online / admin). The tag
+# holds today's role only — it is reset as the day is planned — so it counts
+# for the day it was last set.
+STAFF_ROLES = """
+SELECT p.name AS "Person", LOWER(TRIM(t.tag)) AS "Role",
+       (t.write_date AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Nairobi')::DATE AS "Date"
+FROM pos_shop_attendant_tag t
+JOIN res_users   u ON u.id = t.user_id
+JOIN res_partner p ON p.id = u.partner_id
+"""
+
+# Attendance from the Attendance app: one row per person per day, as the app
+# works it out from the clock-ins against the roster (the shop manager clocks
+# in and out, and enters the brand ambassadors, who have no login). Person is
+# the name the tills know them by — their login's — so it matches Served By;
+# someone without a login (a BA) is known by their employee name. Status is
+# the app's: present, late, absent, leave, off, ooo or unrostered.
+SHOP_ATTENDANCE = """
+SELECT d.date                                                    AS "Date",
+       COALESCE(NULLIF(TRIM(up.name), ''), TRIM(e.name))         AS "Person",
+       TRIM(e.name)                                              AS "Employee",
+       (e.user_id IS NOT NULL)                                   AS "Has Login",
+       -- A brand ambassador is on a till's BA list (no login of their own).
+       EXISTS (SELECT 1 FROM pos_shop_ba b WHERE b.employee_id = e.id) AS "Is BA",
+       COALESCE(pc.name, l.name)                                 AS "Shop",
+       l.type                                                    AS "Place Type",
+       COALESCE(d.rostered, FALSE)                               AS "Rostered",
+       d.shift_label                                             AS "Shift",
+       d.rostered_start                                          AS "Shift Start",
+       -- Minutes after the shift start before a clock-in counts as late
+       -- (15 on every shop shift); Late Minutes are counted after it.
+       COALESCE(d.grace_minutes, 0)                              AS "Grace",
+       d.status                                                  AS "Status",
+       COALESCE(d.late_minutes, 0)                               AS "Late Minutes",
+       NULLIF(d.first_in_local, '')                              AS "First In",
+       NULLIF(d.last_out_local, '')                              AS "Last Out",
+       COALESCE(d.worked_minutes, 0)                             AS "Worked Minutes"
+FROM denri_att_day d
+JOIN hr_employee e             ON e.id = d.employee_id
+LEFT JOIN res_users u          ON u.id = e.user_id
+LEFT JOIN res_partner up       ON up.id = u.partner_id
+LEFT JOIN denri_att_location l ON l.id = d.location_id
+LEFT JOIN pos_config pc        ON pc.id = l.pos_config_id
+WHERE d.date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+"""
+
+# Stock counts submitted from the scan-count app, per shop: how far the
+# counted quantities were from the system's.
+STOCK_COUNT_VARIANCE = """
+SELECT pc.name AS "Shop", COUNT(DISTINCT s.id) AS "Counts",
+       SUM(ABS(l.difference)) AS "Abs Difference", SUM(l.system_qty) AS "System Qty"
+FROM denri_scan_count_session s
+JOIN denri_scan_count_line l ON l.session_id = s.id
+JOIN pos_config pc ON pc.id = s.pos_config_id
+WHERE s.state = 'submitted'
+  AND s.start_time >= CAST(:start_date AS TIMESTAMP)
+  AND s.start_time < CAST(:end_date AS TIMESTAMP) + INTERVAL '1 day'
+GROUP BY 1
+"""
+
+# Bag lines per order (refunds netted), for new-product sales per attendant.
+SCORECARD_BAG_LINES = r"""
+WITH refunded AS (
+    SELECT r.refunded_orderline_id AS line_id, SUM(r.qty) AS qty
+    FROM pos_order_line r
+    WHERE r.refunded_orderline_id IS NOT NULL
+    GROUP BY r.refunded_orderline_id
+)
+SELECT po.id AS "Order ID", pt.name AS "Product", SUM(pol.qty + COALESCE(ref.qty, 0)) AS "Qty"
+FROM pos_order po
+JOIN pos_order_line   pol ON pol.order_id = po.id
+LEFT JOIN refunded    ref ON ref.line_id = pol.id
+JOIN product_product  pp  ON pp.id = pol.product_id
+JOIN product_template pt  ON pt.id = pp.product_tmpl_id
+LEFT JOIN product_category pc ON pc.id = pt.categ_id
+WHERE po.state IN ('done', 'paid', 'invoiced')
+  AND po.date_order >= CAST(:start_date AS TIMESTAMP)
+  AND po.date_order < CAST(:end_date AS TIMESTAMP) + INTERVAL '1 day'
+  AND pol.qty > 0
+  AND pc.complete_name ILIKE 'Bags%'
+  AND NOT COALESCE(pol.is_combo_line, FALSE) AND NOT COALESCE(pt.is_combo, FALSE)
+GROUP BY 1, 2
+"""
+
+
+# ------------------------------------------------------------- dispatch ---
+# Inputs for lib.dispatch (the Dispatch page): the dispatch module's shops,
+# requests and transits, the shops' end-of-day stock snapshots, and the
+# inventory module's stock moves. Bags only throughout.
+
+_BAGS_ONLY = """
+JOIN product_product  pp ON pp.id = {alias}.product_id
+JOIN product_template pt ON pt.id = pp.product_tmpl_id
+JOIN product_category pc ON pc.id = pt.categ_id AND pc.complete_name ILIKE 'Bags%%'
+"""
+
+# The retail shops the dispatch module serves, with their stock and
+# goods-in-transit locations.
+DISPATCH_SHOPS = """
+SELECT ds.id AS "Shop ID", ds.name AS "Shop", ds.stock_location_id AS "Stock Location",
+       ds.transit_location_id AS "Transit Location"
+FROM denri_dispatch_shop ds
+WHERE ds.active AND ds.shop_type = 'retail' AND ds.include_in_dispatch
+"""
+
+# Each shop's bags as at the end of a day: the last end-of-day snapshot taken
+# on or before it (they run nightly).
+SHOP_STOCK_AT = """
+WITH snap AS (
+    SELECT id, snapshot_datetime FROM denri_shop_stock_snapshot
+    WHERE snapshot_type = 'eod' AND state = 'done'
+      -- taken at 21:00 UTC, midnight in Nairobi: its UTC date is the day it closes
+      AND snapshot_datetime::DATE <= CAST(:day AS DATE)
+    ORDER BY snapshot_datetime DESC LIMIT 1
+)
+SELECT l.shop_id AS "Shop ID", l.product_id AS "Product ID", pt.name AS "SKU",
+       SUM(l.qty_on_hand) AS "Qty", MAX(snap.snapshot_datetime) AS "Taken"
+FROM denri_shop_stock_snapshot_line l
+JOIN snap ON snap.id = l.snapshot_id
+""" + _BAGS_ONLY.format(alias="l") + """
+GROUP BY 1, 2, 3
+"""
+
+# Every done stock move into or out of a shop's stock between two moments
+# (the opening and closing snapshots), by kind: received from dispatch (out
+# of the shop's own goods-in-transit location), transfers that skipped
+# dispatch, sales and customer returns, and inventory adjustments.
+SHOP_STOCK_MOVES = """
+WITH shops AS (
+    SELECT id, stock_location_id AS loc, transit_location_id AS tr
+    FROM denri_dispatch_shop WHERE active AND shop_type = 'retail' AND include_in_dispatch
+)
+SELECT s.id AS "Shop ID", m.product_id AS "Product ID", pt.name AS "SKU",
+       CASE
+           WHEN m.location_dest_id = s.loc AND m.location_id = s.tr   THEN 'Received from Dispatch'
+           WHEN m.location_dest_id = s.loc AND ls.usage = 'customer'  THEN 'Customer Returns'
+           WHEN m.location_dest_id = s.loc AND ls.usage = 'inventory' THEN 'Adjustments In'
+           WHEN m.location_dest_id = s.loc                            THEN 'Transfers In (outside dispatch)'
+           WHEN ld.usage = 'customer'                                 THEN 'Sold'
+           WHEN ld.usage = 'inventory'                                THEN 'Adjustments Out'
+           ELSE 'Transfers Out'
+       END AS "Kind",
+       COALESCE(NULLIF(ls.complete_name, ''), ls.name) AS "From",
+       COALESCE(NULLIF(ld.complete_name, ''), ld.name) AS "To",
+       SUM(m.product_qty) AS "Qty", COUNT(*) AS "Moves"
+FROM stock_move m
+JOIN shops s ON s.loc IN (m.location_id, m.location_dest_id)
+JOIN stock_location ls ON ls.id = m.location_id
+JOIN stock_location ld ON ld.id = m.location_dest_id
+""" + _BAGS_ONLY.format(alias="m") + """
+WHERE m.state = 'done'
+  AND m.location_id <> m.location_dest_id
+  AND m.date > CAST(:start_ts AS TIMESTAMP) AND m.date <= CAST(:end_ts AS TIMESTAMP)
+GROUP BY 1, 2, 3, 4, 5, 6
+"""
+
+# Dispatches to the shops in the period, with what was asked for them.
+DISPATCH_TRANSIT_LINES = """
+SELECT t.shop_id AS "Shop ID", t.name AS "Transit", t.source_type AS "Source",
+       o.name AS "Order", o.request_type AS "Request Type", o.requested_by_name AS "Requested By",
+       (t.dispatch_date AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Nairobi')::DATE AS "Dispatched On",
+       (t.receive_date AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Nairobi')::DATE AS "Received On",
+       t.state AS "State", tl.product_id AS "Product ID", pt.name AS "SKU",
+       COALESCE(tl.qty_effective_dispatched, tl.qty_dispatched) AS "Dispatched",
+       tl.qty_received AS "Received", tl.qty_in_transit AS "In Transit"
+FROM denri_dispatch_transit t
+JOIN denri_dispatch_transit_line tl ON tl.transit_id = t.id
+LEFT JOIN denri_dispatch_order o ON o.id = t.order_id
+""" + _BAGS_ONLY.format(alias="tl") + """
+WHERE t.state <> 'cancel'
+  AND t.dispatch_date >= CAST(:start_date AS TIMESTAMP) - INTERVAL '3 hours'
+  AND t.dispatch_date < CAST(:end_date AS TIMESTAMP) + INTERVAL '21 hours'
+"""
+
+# What the shops asked for (stock ordering in the dispatch module) in the
+# period, line by line, and how much was dispatched and received.
+SHOP_REQUEST_LINES = """
+SELECT o.shop_id AS "Shop ID", o.name AS "Order", o.state AS "State",
+       o.order_date::DATE AS "Ordered On", o.requested_by_name AS "Requested By",
+       ol.product_id AS "Product ID", pt.name AS "SKU",
+       ol.qty_ordered AS "Requested", ol.qty_fulfilled AS "Dispatched", ol.qty_received AS "Received",
+       ol.qty_remaining AS "Outstanding"
+FROM denri_dispatch_order o
+JOIN denri_dispatch_order_line ol ON ol.order_id = o.id
+""" + _BAGS_ONLY.format(alias="ol") + """
+WHERE o.request_type = 'shop' AND o.state NOT IN ('draft')
+  AND o.order_date::DATE BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+"""
+
+
+
+# --------------------------------------------------------- stock movement ---
+# Inputs for lib.stock_flow (Stock Levels → Stock Movement): every done move of
+# bags into or out of an outlet's stock, and what each outlet holds now. An
+# outlet is a shop's warehouse, the Website, or the CBD store; moves between
+# two locations of the same outlet are left out.
+
+_FLOW_OUTLETS = """
+outlets AS (
+    SELECT code, name FROM stock_warehouse
+    WHERE code IN ('CBD','STAR','HAZ','MSA','NAKS','ELD','KSM','MERU','THK','KITE','WEB','NAN',
+                   'KAK','HTN','DAR','UG','KSI','KTDA','BUSIA','RONG','NYERI','MACHA')
+)"""
+
+_FLOW_BAGS = """
+JOIN product_product  pp ON pp.id = {alias}.product_id
+JOIN product_template pt ON pt.id = pp.product_tmpl_id
+JOIN product_category pc ON pc.id = pt.categ_id
+    AND pc.complete_name ILIKE 'Bags /%' AND pc.complete_name NOT ILIKE '%Clothing%'
+"""
+
+# Bags per outlet, Nairobi day and kind, from each outlet's side of the move:
+# out to a customer is Sold, back from one is Returns, to or from an
+# inventory location is an adjustment, anything else a transfer.
+STOCK_FLOW_MOVES = "WITH" + _FLOW_OUTLETS + """,
+moves AS (
+    SELECT m.product_qty AS qty,
+           (m.date AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Nairobi')::DATE AS day,
+           so.code AS src, dst.code AS dst, ls.usage AS src_usage, ld.usage AS dst_usage
+    FROM stock_move m
+    JOIN stock_location ls ON ls.id = m.location_id
+    JOIN stock_location ld ON ld.id = m.location_dest_id
+    LEFT JOIN outlets so  ON ls.usage = 'internal' AND so.code  = split_part(ls.complete_name, '/', 1)
+    LEFT JOIN outlets dst ON ld.usage = 'internal' AND dst.code = split_part(ld.complete_name, '/', 1)
+""" + _FLOW_BAGS.format(alias="m") + """
+    WHERE m.state = 'done'
+      AND m.date >= CAST(:start_date AS TIMESTAMP) - INTERVAL '3 hours'
+      AND m.date <  CAST(:end_date AS TIMESTAMP) + INTERVAL '21 hours'
+      AND (so.code IS NOT NULL OR dst.code IS NOT NULL)
+      AND COALESCE(so.code, '') <> COALESCE(dst.code, '')
+      AND NOT COALESCE(pt.is_combo, FALSE)
+)
+SELECT day AS "Date", src AS "Code",
+       CASE dst_usage WHEN 'customer' THEN 'Sold' WHEN 'inventory' THEN 'Adj Removed'
+                      ELSE 'Transferred Out' END AS "Kind",
+       SUM(qty) AS "Qty"
+FROM moves WHERE src IS NOT NULL GROUP BY 1, 2, 3
+UNION ALL
+SELECT day, dst,
+       CASE src_usage WHEN 'customer' THEN 'Returns' WHEN 'inventory' THEN 'Adj Added'
+                      ELSE 'Received' END,
+       SUM(qty)
+FROM moves WHERE dst IS NOT NULL GROUP BY 1, 2, 3
+"""
+
+# Each outlet's bags right now: on hand, and standing in its own
+# FINWH/Goods in Transit location.
+STOCK_FLOW_NOW = r"WITH" + _FLOW_OUTLETS + r""",
+transit AS (
+    SELECT sl.id,
+           CASE UPPER(split_part(sl.complete_name, '/', 3))
+               WHEN 'CBD STOCKS'    THEN 'CBD'
+               WHEN 'WEBSITE STORE' THEN 'WEB'
+               ELSE (SELECT o.code FROM outlets o
+                     WHERE UPPER(TRIM(REGEXP_REPLACE(o.name, '\s*SHOP\s*', '', 'gi')))
+                         = UPPER(TRIM(REGEXP_REPLACE(split_part(sl.complete_name, '/', 3),
+                                                     '\s*SHOP\s*', '', 'gi')))
+                     LIMIT 1)
+           END AS code
+    FROM stock_location sl
+    WHERE sl.complete_name ILIKE 'FINWH/Goods in Transit/%'
+),
+placed AS (
+    SELECT o.code, 'Current Stock' AS kind, sq.quantity, sq.product_id
+    FROM stock_quant sq
+    JOIN stock_location sl ON sl.id = sq.location_id AND sl.usage = 'internal'
+    JOIN outlets o ON o.code = split_part(sl.complete_name, '/', 1)
+    UNION ALL
+    SELECT t.code, 'In Transit', sq.quantity, sq.product_id
+    FROM stock_quant sq
+    JOIN transit t ON t.id = sq.location_id AND t.code IS NOT NULL
+)
+SELECT o.code AS "Code", o.name AS "Warehouse", p.kind AS "Kind", SUM(p.quantity) AS "Qty"
+FROM placed p
+JOIN outlets o ON o.code = p.code
+""" + _FLOW_BAGS.format(alias="p") + r"""
+WHERE NOT COALESCE(pt.is_combo, FALSE)
+GROUP BY 1, 2, 3
+"""
+
+
+# ---------------------------------------------------------- lead recycling ---
+# Inputs for lib.lead_recycling (WhatsApp & Social DMs → Lead Recycling), built
+# to load in parallel in a few seconds rather than reuse the tab queries.
+
+# WhatsApp chats in the window with only what recycling reads, the follow-up
+# outcome included. A transfer counts as converted when the receiving branch
+# sold. Names come from RECYCLE_WA_NAMES, looked up alongside.
+RECYCLE_WA_TOUCHES = """
+SELECT i.id AS "ID", i.date AS "Date",
+       COALESCE(NULLIF(TRIM(i.customer_name), ''), NULLIF(TRIM(i.wa_username), '')) AS "Name",
+       COALESCE(NULLIF(TRIM(i.phone), ''), i.phone_clean) AS "Contact",
+       COALESCE(sh.name, 'Not recorded') AS "Branch", COALESCE(src.name, 'Not recorded') AS "Source",
+       i.activity AS "Activity",
+       (i.activity = 'purchased' OR COALESCE(i.is_purchased, FALSE)
+        OR dest.activity = 'purchased' OR COALESCE(dest.is_purchased, FALSE)) AS "Converted",
+       (COALESCE(rsn.is_out_of_stock, FALSE) OR i.oos_bag_id IS NOT NULL OR i.oos_product_id IS NOT NULL) AS "Out of Stock",
+       i.followup_outcome AS "Follow-up Outcome", i.followup_recorded_on::DATE AS "Followed Up On"
+FROM denri_monitor_interaction i
+LEFT JOIN denri_monitor_shop sh ON sh.id = i.shop_id
+LEFT JOIN denri_monitor_source src ON src.id = i.source_id
+LEFT JOIN denri_monitor_reason rsn ON rsn.id = i.reason_id
+LEFT JOIN denri_monitor_interaction dest ON dest.id = i.transferred_to_id
+WHERE i.date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+"""
+
+# The contact's name in Odoo for each WhatsApp phone in the window, for chats
+# that recorded no name.
+RECYCLE_WA_NAMES = "WITH " + _WA_PARTNER_BY_PHONE.format(date_col="date") + """
+SELECT key AS "Phone Key", name AS "Partner Name" FROM partner_by_phone
+"""
+
+# The bags each WhatsApp chat in the window asked for that were out of stock —
+# WA_OUT_OF_STOCK's products without its customer details.
+RECYCLE_WA_WANTED = """
+SELECT w.interaction_id AS "ID", w.product AS "Product Wanted"
+FROM (
+    SELECT r.interaction_id, pt.name AS product
+    FROM denri_monitor_interaction_oos_product_rel r
+    JOIN product_template pt ON pt.id = r.product_id
+    UNION
+    SELECT i.id, pt.name FROM denri_monitor_interaction i
+    JOIN product_template pt ON pt.id = i.oos_product_id
+    UNION
+    SELECT i.id, b.name FROM denri_monitor_interaction i
+    JOIN denri_monitor_bag b ON b.id = i.oos_bag_id
+) w
+JOIN denri_monitor_interaction i ON i.id = w.interaction_id
+WHERE i.date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+"""
+
+# Bag purchases since the window opened by any customer whose phone appears in
+# one of the three apps in it — one row per phone and day. Matched in the
+# database: only partners who bought in the window have their phone read,
+# instead of sending every lead's phone to be compared with every partner.
+RECYCLE_PURCHASES = r"""
+WITH lead_keys AS (
+    SELECT phone_key AS key FROM denri_monitor_interaction
+    WHERE date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+    UNION
+    SELECT RIGHT(REGEXP_REPLACE(COALESCE(NULLIF(TRIM(phone), ''), alt_phone, ''), '[^0-9]', '', 'g'), 9)
+    FROM denri_social_dm WHERE date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+    UNION
+    SELECT RIGHT(REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g'), 9)
+    FROM denri_lead WHERE active AND capture_date - 1 BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)
+), orders AS (
+    SELECT po.id, po.partner_id, po.date_order::DATE AS day, po.session_id,
+           COALESCE(NULLIF(po.currency_rate, 0), 1) AS rate
+    FROM pos_order po
+    WHERE po.state IN ('done', 'paid', 'invoiced') AND po.partner_id IS NOT NULL
+      AND po.date_order >= CAST(:start_date AS DATE)
+), buyers AS (
+    SELECT p.id, p.key FROM (
+        SELECT rp.id, RIGHT(REGEXP_REPLACE(COALESCE(rp.phone, rp.mobile, ''), '[^0-9]', '', 'g'), 9) AS key
+        FROM res_partner rp WHERE rp.id IN (SELECT partner_id FROM orders)) p
+    JOIN lead_keys k ON k.key = p.key
+    WHERE length(p.key) = 9
+), delivered AS (
+    -- Orders that carry a delivery fee: sent out from the shop, not a walk-in.
+    SELECT DISTINCT dl.order_id
+    FROM pos_order_line dl
+    JOIN product_product dpp ON dpp.id = dl.product_id
+    JOIN product_template dpt ON dpt.id = dpp.product_tmpl_id
+    WHERE dpt.name ILIKE '%Delivery Fee%'
+      AND dl.order_id IN (SELECT o.id FROM orders o JOIN buyers b ON b.id = o.partner_id)
+)
+SELECT b.key AS "Phone Key", o.day AS "Bought On", (dv.order_id IS NOT NULL) AS "Delivered",
+       MIN(CASE
+           WHEN lower(pconf.name) IN ('website sales', 'website') OR o.session_id IS NULL THEN 'Website'
+           WHEN lower(pconf.name) = 'jumia' THEN 'Jumia'
+           WHEN COALESCE(sw.name, sl.complete_name) ILIKE '%Dar-Es-Alam%' THEN 'Sinza'
+           ELSE INITCAP(TRIM(REGEXP_REPLACE(
+                   COALESCE(sw.name, sl.complete_name, pconf.name, 'N/A'), '\s*Shop\s*', '', 'gi')))
+       END) AS "Bought At",
+       SUM(pol.price_subtotal_incl / o.rate) AS "Amount", SUM(pol.qty) AS "Bags"
+FROM orders o
+JOIN buyers b                  ON b.id = o.partner_id
+LEFT JOIN delivered dv         ON dv.order_id = o.id
+JOIN pos_order_line pol        ON pol.order_id = o.id
+JOIN product_product pp        ON pp.id = pol.product_id
+JOIN product_template pt       ON pt.id = pp.product_tmpl_id
+JOIN product_category pc       ON pc.id = pt.categ_id
+LEFT JOIN pos_session ps       ON ps.id = o.session_id
+LEFT JOIN pos_config pconf     ON pconf.id = ps.config_id
+LEFT JOIN stock_picking_type spt ON spt.id = pconf.picking_type_id
+LEFT JOIN stock_warehouse sw   ON sw.id = spt.warehouse_id
+LEFT JOIN stock_location sl    ON sl.id = spt.default_location_src_id
+WHERE pol.qty > 0 AND pc.complete_name ILIKE 'Bags%' AND NOT COALESCE(pol.is_combo_line, FALSE)
+GROUP BY 1, 2, 3
+"""

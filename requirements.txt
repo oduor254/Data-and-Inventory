@@ -1,0 +1,8 @@
+# Pinned: a floating Streamlit version breaks tabs left open across an update.
+streamlit==1.59.2
+pandas>=2.2
+SQLAlchemy>=2.0
+psycopg[binary]>=3.2
+plotly>=5.24
+python-dotenv>=1.0
+streamlit-aggrid==1.2.1.post2

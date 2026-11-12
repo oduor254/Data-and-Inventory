@@ -4,7 +4,7 @@ and Stock Count.
 Live from the Odoo Postgres database; credentials and the login password
 are in .env.
 
-Run locally:  .venv/Scripts/streamlit run app.py   (opens on port 8510)
+Run locally:  run.bat   (opens on port 8510)
 """
 from __future__ import annotations
 

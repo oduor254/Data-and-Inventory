@@ -44,8 +44,6 @@ borderColor = "#2a2a33"
 
 [server]
 runOnSave = true
-# own port, so it never lands on another Denri dashboard already on 8501
-port = 8510
 
 [browser]
 gatherUsageStats = false

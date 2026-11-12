@@ -628,7 +628,7 @@ def render_warehouse() -> None:
     """The main events in Odoo's Warehouse/Store app (queries.WAREHOUSE_EVENTS)."""
     c1, _ = st.columns([1, 3])
     with c1:
-        start, end = filters.date_range_control("warehouse", default="Last 7 Days")
+        start, end = filters.date_range_control("warehouse", default="This Week")
     df = db.run_query(queries.WAREHOUSE_EVENTS, {"start_date": start, "end_date": end})
     waiting = df[df["Open"]]
     period = df[df["Date"].dt.date.between(start, end)]

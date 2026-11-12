@@ -626,9 +626,7 @@ _EVENT_DATE = {"Date": st.column_config.DatetimeColumn(format="ddd D MMM, HH:mm"
 
 def render_warehouse() -> None:
     """The main events in Odoo's Warehouse/Store app (queries.WAREHOUSE_EVENTS)."""
-    c1, _ = st.columns([1, 3])
-    with c1:
-        start, end = filters.date_range_control("warehouse", default="This Week")
+    start, end = filters.date_range_control("warehouse", default="This Week")
     df = db.run_query(queries.WAREHOUSE_EVENTS, {"start_date": start, "end_date": end})
     waiting = df[df["Open"]]
     period = df[df["Date"].dt.date.between(start, end)]
@@ -679,6 +677,8 @@ def _cbd_movement(start: date, end: date) -> None:
     if mv.empty:
         st.info("Nothing moved in or out of CBD/Stock in this period.")
         return
+    by_product = mv
+    mv = mv.groupby(["Direction", "Kind", "Location"], as_index=False)[["Units", "Moves"]].sum()            .sort_values("Units", ascending=False)
     came_in, went_out = mv[mv["Direction"] == "In"], mv[mv["Direction"] == "Out"]
     out_kind = went_out.groupby("Kind")["Units"].sum()
     transferred = went_out[went_out["Kind"] == "Transferred Out"]
@@ -706,6 +706,19 @@ def _cbd_movement(start: date, end: date) -> None:
             st.markdown(f"**{title}**")
             st.dataframe(part[["Location", "Kind", "Units", "Moves"]], hide_index=True, width="stretch",
                          column_config={"Units": st.column_config.NumberColumn(format="%d")})
+
+    st.markdown("**Products moved — by colour**")
+    with st.container(border=True):
+        st.caption("Each colour of each bag, in and out of CBD/Stock over the period.")
+        totals = by_product.pivot_table(index="Product", columns="Direction", values="Units",
+                                        aggfunc="sum", fill_value=0).reindex(columns=["In", "Out"], fill_value=0)
+        totals["Net"] = totals["In"] - totals["Out"]
+        totals.insert(0, "Bag", totals.index.map(colors.strip_color))
+        grid.filterable_table(totals.reset_index().sort_values(["Bag", "Product"])[["Bag", "Product", "In", "Out", "Net"]])
+    with st.container(border=True):
+        st.caption("The same, split by where it came from or went to. Filter the Location column to see one shop.")
+        grid.filterable_table(by_product.assign(Bag=by_product["Product"].map(colors.strip_color))
+                              [["Direction", "Kind", "Location", "Bag", "Product", "Units"]])
 
 
 SECTIONS = {"🏪 Shop Stocks": render_shop_stock, "🔮 Stock Prediction & Movement": render_prediction,

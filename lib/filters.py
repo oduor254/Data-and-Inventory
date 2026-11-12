@@ -1,4 +1,4 @@
-"""Shared date-range filter: a compact PERIOD dropdown with a custom range as
+"""Shared date-range filter: a row of PERIOD buttons with a custom range as
 the fallback — reused by every domain page."""
 from __future__ import annotations
 
@@ -6,45 +6,8 @@ from datetime import date, timedelta
 
 import streamlit as st
 
-from lib import ui
-
 PRESETS = ["Today", "Yesterday", "This Week", "Last Week", "Last 7 Days", "Last 30 Days",
            "Month to Date", "Custom"]
-
-_PERIOD_CSS = f"""
-<style>
-/* Compact PERIOD picker: small muted caps label over a narrow dropdown, with
-   the selected option in the nav accent so it reads as current state. */
-.denri-period-wrap {{ max-width: 210px; }}
-.denri-period-wrap label p {{
-  color: {ui.TEXT_MUTED} !important;
-  font-size: 0.68rem !important;
-  font-weight: 600;
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-  margin-bottom: 2px !important;
-}}
-.denri-period-wrap div[data-baseweb="select"] > div {{
-  background: var(--denri-field, #10161a);
-  border: 1px solid var(--denri-hair, rgba(255,255,255,0.09));
-  border-radius: 9px;
-  min-height: 36px;
-  font-size: 0.86rem;
-}}
-.denri-period-wrap div[data-baseweb="select"] > div:hover {{
-  border-color: rgba(165,148,249,0.55);
-}}
-/* dropdown menu */
-ul[data-baseweb="menu"] li[aria-selected="true"] {{
-  background: {ui.ACCENT_SOFT} !important;
-  color: {ui.ACCENT} !important;
-}}
-ul[data-baseweb="menu"] li:hover {{
-  background: rgba(var(--denri-ink-rgb, 255,255,255),0.05);
-}}
-</style>
-"""
-
 
 def _preset_range(preset: str, today: date) -> tuple[date, date]:
     if preset == "Yesterday":
@@ -89,21 +52,14 @@ def resolve_range(key_prefix: str, default: str = "Today") -> tuple[date, date]:
 
 
 def date_range_control(key_prefix: str, default: str = "Today") -> tuple[date, date]:
-    """Render the PERIOD dropdown (+ a custom picker when 'Custom' is chosen).
+    """Render the PERIOD buttons, every option visible (+ a custom picker when 'Custom' is chosen).
 
     Returns (start_date, end_date) for the caller to bind into a query.
     """
     today = date.today()
 
-    st.markdown(_PERIOD_CSS, unsafe_allow_html=True)
-    st.markdown('<div class="denri-period-wrap">', unsafe_allow_html=True)
-    preset = st.selectbox(
-        "Period",
-        PRESETS,
-        index=PRESETS.index(default) if default in PRESETS else 0,
-        key=f"{key_prefix}_preset",
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
+    preset = st.segmented_control("Period", PRESETS, default=default if default in PRESETS else PRESETS[0],
+                                  key=f"{key_prefix}_preset")
 
     preset = preset or default
 

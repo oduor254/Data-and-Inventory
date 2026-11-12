@@ -5779,14 +5779,17 @@ ORDER BY f.at DESC
 
 
 # Everything that crossed CBD/Stock's boundary in the period, summed by
-# direction, kind and the location on the other side. Moves between CBD/Stock's
+# direction, kind, product (colour variant) and the location on the other side. Moves between CBD/Stock's
 # own sub-locations are not movement. Days are Nairobi days.
 CBD_STOCK_MOVES = """
 WITH moves AS (
     SELECT m.product_qty AS qty, ls.complete_name LIKE 'CBD/Stock%' AS is_out,
            CASE WHEN ls.complete_name LIKE 'CBD/Stock%' THEN ld.complete_name ELSE ls.complete_name END AS other,
-           CASE WHEN ls.complete_name LIKE 'CBD/Stock%' THEN ld.usage ELSE ls.usage END AS other_usage
+           CASE WHEN ls.complete_name LIKE 'CBD/Stock%' THEN ld.usage ELSE ls.usage END AS other_usage,
+           COALESCE(pt."name", pp.id::text) AS product
     FROM stock_move m
+    JOIN product_product pp ON pp.id = m.product_id
+    LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id
     JOIN stock_location ls ON ls.id = m.location_id
     JOIN stock_location ld ON ld.id = m.location_dest_id
     WHERE m.state = 'done'
@@ -5802,6 +5805,6 @@ SELECT CASE WHEN is_out THEN 'Out' ELSE 'In' END AS "Direction",
             WHEN 'transit'   THEN CASE WHEN is_out THEN 'Transferred Out' ELSE 'Transferred In' END
             WHEN 'supplier'  THEN 'Supplier'
             ELSE INITCAP(other_usage) END AS "Kind",
-       other AS "Location", SUM(qty) AS "Units", COUNT(*) AS "Moves"
-FROM moves GROUP BY 1, 2, 3 ORDER BY 1, 4 DESC
+       other AS "Location", product AS "Product", SUM(qty) AS "Units", COUNT(*) AS "Moves"
+FROM moves GROUP BY 1, 2, 3, 4 ORDER BY 1, 5 DESC
 """

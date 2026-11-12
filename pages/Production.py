@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from lib import auth, db, filters, grid, queries, theme
+from lib import auth, colors, db, filters, grid, queries, theme
 
 st.set_page_config(page_title=auth.page_title("Production"), page_icon="🏭", layout="wide")
 
@@ -82,4 +82,56 @@ def render_production(start_date: date, end_date: date) -> None:
         grid.filterable_table(df[["Metric", "Product", "Quantity"]])
 
 
-render_production(start_date, end_date)
+@st.fragment()
+def render_finished(start_date: date, end_date: date) -> None:
+    """Bags finished by production before they are put away (queries.FINISHED_OUTPUT)."""
+    df = db.run_query(queries.FINISHED_OUTPUT, {"start_date": start_date, "end_date": end_date})
+    now = db.run_query(queries.FINISHED_NOT_STORED)
+    waiting = now.groupby("Stage")["Bags"].sum()
+
+    daily = df.groupby("Date")["Finished"].sum()
+    daily = daily[daily > 0]
+    finished, failed = df["Finished"].sum(), df["QC Failed"].sum()
+    tiles = [
+        ("Bags Finished", f"{finished:,.0f}", "passed quality check"),
+        ("Average per Working Day", f"{daily.mean():,.0f}" if len(daily) else "0", f"over {len(daily)} working days"),
+        ("Best Day", f"{daily.max():,.0f}" if len(daily) else "0", f"{daily.idxmax():%a %d %b}" if len(daily) else None),
+        ("Failed Quality Check", f"{failed:,.0f}",
+         f"{failed / (finished + failed):.1%} of bags checked" if finished + failed else None),
+        ("Waiting for Quality Check", f"{waiting.get('Waiting for quality check', 0):,.0f}", "right now"),
+        ("Finished, Not Yet in Store", f"{waiting.get('Finished, not yet in store', 0):,.0f}", "right now"),
+    ]
+    for col, (label, value, note) in zip(st.columns(3) + st.columns(3), tiles):
+        with col.container(border=True):
+            st.metric(label, value)
+            st.caption(note or " ")
+
+    if df.empty:
+        st.info("No bags were finished in this date range.")
+    else:
+        with st.container(border=True):
+            fig = go.Figure()
+            fig.add_bar(x=daily.index, y=daily.values, marker=dict(color=theme.CATEGORICAL[0], cornerradius=4))
+            theme.apply_layout(fig, show_legend=False)
+            fig.update_layout(title="Bags Finished per Day", height=360)
+            theme.show(fig, width="stretch")
+
+        st.subheader("Finished by product and colour")
+        with st.container(border=True):
+            by_product = df.groupby("Product", as_index=False)[["Finished", "QC Failed"]].sum()
+            by_product.insert(0, "Bag", by_product["Product"].map(colors.strip_color))
+            grid.filterable_table(by_product.sort_values("Finished", ascending=False))
+
+    if not now.empty:
+        st.subheader("Not yet in the store — right now")
+        st.caption("Bags collected from the tailors that are waiting for quality check, or finished and waiting "
+                   "to be put away. This ignores the date range above.")
+        with st.container(border=True):
+            grid.filterable_table(now)
+
+
+tab_stages, tab_finished = st.tabs(["🧵 Production Stages", "✅ Finished Output"])
+with tab_stages:
+    render_production(start_date, end_date)
+with tab_finished:
+    render_finished(start_date, end_date)

@@ -5808,3 +5808,36 @@ SELECT CASE WHEN is_out THEN 'Out' ELSE 'In' END AS "Direction",
        other AS "Location", product AS "Product", SUM(qty) AS "Units", COUNT(*) AS "Moves"
 FROM moves GROUP BY 1, 2, 3, 4 ORDER BY 1, 5 DESC
 """
+
+
+# Production output: bags that passed quality check and were validated as
+# finished (denri_bag_ledger_event, qc_pass -> validated), and bags that failed
+# it, per Nairobi day and product. This is the step before a bag is put away in
+# the store, so it measures what production turned out, not what was shipped.
+FINISHED_OUTPUT = """
+SELECT (e.event_time + INTERVAL '3 hours')::DATE AS "Date",
+       COALESCE(pt."name", pp.id::text) AS "Product",
+       COUNT(*) FILTER (WHERE e.new_state = 'validated') AS "Finished",
+       COUNT(*) FILTER (WHERE e.new_state = 'qc_fail')   AS "QC Failed"
+FROM denri_bag_ledger_event e
+JOIN product_product pp ON pp.id = e.product_id
+LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id
+WHERE e.kind = 'move'
+  AND ((e.prev_state = 'qc_pass' AND e.new_state = 'validated')
+    OR (e.prev_state = 'collected' AND e.new_state = 'qc_fail'))
+  AND e.event_time >= CAST(:start_date AS TIMESTAMP) - INTERVAL '3 hours'
+  AND e.event_time <  CAST(:end_date AS TIMESTAMP) + INTERVAL '21 hours'
+GROUP BY 1, 2 ORDER BY 1, 3 DESC
+"""
+
+# Bags sitting between the tailor and the store right now: collected (waiting
+# for quality check), or passed and validated but not yet put away.
+FINISHED_NOT_STORED = """
+SELECT CASE u.state WHEN 'collected' THEN 'Waiting for quality check' ELSE 'Finished, not yet in store' END AS "Stage",
+       COALESCE(pt."name", pp.id::text) AS "Product", COUNT(*) AS "Bags", MIN(u.stage_date)::DATE AS "Oldest Since"
+FROM denri_bag_unit u
+JOIN product_product pp ON pp.id = u.bag_product_id
+LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id
+WHERE u.active AND u.state IN ('collected', 'qc_pass', 'validated')
+GROUP BY 1, 2 ORDER BY 1, 3 DESC
+"""

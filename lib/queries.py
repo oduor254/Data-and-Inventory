@@ -1789,7 +1789,7 @@ WHERE sl.usage = 'internal'
     OR sl.complete_name ILIKE 'DAR/Stock%'   OR sl.complete_name ILIKE 'UG/Stock%'
     OR sl.complete_name ILIKE 'KSI/Stock%'   OR sl.complete_name ILIKE 'KTDA/Stock%'
     OR sl.complete_name ILIKE 'BUSIA/Stock%' OR sl.complete_name ILIKE 'RONG/Stock%'
-    OR sl.complete_name ILIKE 'CBD/Stock%'
+    OR sl.complete_name ILIKE 'CBD/Stock%'   OR sl.complete_name ILIKE 'VLD/Stock%'
     OR sl.complete_name ILIKE 'WEB/Stock%' OR sl.complete_name ILIKE '%WEBSITE%'
   )
   AND COALESCE(pt."name", '') NOT ILIKE '%+%'          -- exclude combo/bundle products
@@ -5720,4 +5720,59 @@ LEFT JOIN stock_warehouse sw   ON sw.id = spt.warehouse_id
 LEFT JOIN stock_location sl    ON sl.id = spt.default_location_src_id
 WHERE pol.qty > 0 AND pc.complete_name ILIKE 'Bags%' AND NOT COALESCE(pol.is_combo_line, FALSE)
 GROUP BY 1, 2, 3
+"""
+
+
+# What Odoo's Warehouse/Store app records, one row per document: transfers,
+# shoot lists, complimentary requests, corporate orders and employee orders.
+# Returns the period's events plus anything still open, whatever its date
+# ("Open": submitted but not yet issued / done, or a shoot list with bags
+# still out). Days are Nairobi days.
+WAREHOUSE_EVENTS = """
+WITH who AS (
+    SELECT ru.id, rp.name FROM res_users ru JOIN res_partner rp ON rp.id = ru.partner_id
+), ev AS (
+    SELECT 'Transfer' AS kind, t.name AS ref, t.date AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Nairobi' AS at,
+           ls.complete_name AS src, ld.complete_name AS dst,
+           CASE WHEN t.is_return THEN 'Return. ' ELSE '' END || COALESCE(t.reason, '') AS detail,
+           t.state, FALSE AS still_out, t.user_id AS uid,
+           (SELECT SUM(l.quantity) FROM ic_transfer_line l WHERE l.transfer_id = t.id) AS qty
+    FROM ic_transfer t
+    JOIN stock_location ls ON ls.id = t.source_location_id
+    JOIN stock_location ld ON ld.id = t.dest_location_id
+    UNION ALL
+    SELECT 'Shoot List', s.name, COALESCE(s.submitted_on, s.create_date) AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Nairobi',
+           '', '', CONCAT_WS(' · ', NULLIF(s.purpose, ''), 'due back ' || TO_CHAR(s.date_due_back, 'DD Mon'),
+                             CASE WHEN s.qty_outstanding > 0 THEN s.qty_outstanding::INT || ' still out' END,
+                             CASE WHEN s.overdue THEN 'OVERDUE' END),
+           s.state, s.state = 'issued' AND s.qty_outstanding > 0, s.requested_by,
+           (SELECT SUM(GREATEST(l.qty_requested, l.qty_issued)) FROM shoot_list_line l WHERE l.shoot_id = s.id)
+    FROM shoot_list s
+    UNION ALL
+    SELECT 'Complimentary', c.name, c.create_date AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Nairobi',
+           '', '', CONCAT_WS(' · ', d.name, NULLIF(c.recipient, '')), c.state, FALSE, c.requested_by,
+           (SELECT SUM(l.quantity) FROM complimentary_request_line l WHERE l.request_id = c.id)
+    FROM complimentary_request c LEFT JOIN inv_department d ON d.id = c.department_id
+    UNION ALL
+    SELECT 'Corporate Order', o.name, o.date_order::TIMESTAMP,
+           '', '', CONCAT_WS(' · ', p.name, NULLIF(o.client_ref, ''),
+                             CASE WHEN o.qty_pending > 0 AND o.state <> 'cancel'
+                                  THEN o.qty_pending::INT || ' pending' END),
+           o.state, FALSE, o.create_uid,
+           (SELECT SUM(l.qty_ordered) FROM corporate_order_line l WHERE l.order_id = o.id)
+    FROM corporate_order o LEFT JOIN res_partner p ON p.id = o.partner_id
+    UNION ALL
+    SELECT 'Employee Order', o.name, o.date_order::TIMESTAMP,
+           '', '', CONCAT_WS(' · ', e.name, NULLIF(o.reason, '')), o.state, FALSE, o.requested_by, o.qty_total
+    FROM ic_employee_order o LEFT JOIN hr_employee e ON e.id = o.employee_id
+), flagged AS (
+    SELECT ev.*, still_out OR state NOT IN ('draft', 'done', 'cancel', 'issued', 'returned', 'declined')
+           AS open FROM ev
+)
+SELECT f.at AS "Date", f.kind AS "Type", f.ref AS "Reference", f.src AS "From", f.dst AS "To",
+       f.detail AS "Detail", INITCAP(f.state) AS "Status", COALESCE(f.qty, 0) AS "Qty",
+       COALESCE(who.name, '') AS "By", f.open AS "Open"
+FROM flagged f LEFT JOIN who ON who.id = f.uid
+WHERE f.open OR f.at::DATE BETWEEN :start_date AND :end_date
+ORDER BY f.at DESC
 """

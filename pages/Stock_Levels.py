@@ -1,6 +1,8 @@
-"""Stock Levels — what the shops hold now (Shop Stocks), and what they will
+"""Stock Levels — what the shops hold now (Shop Stocks), what they will
 need: top sellers, the stock report and min/max levels against the targets
-(Stock Prediction & Movement)."""
+(Stock Prediction & Movement), and what the warehouse did and still owes:
+transfers, shoot lists, complimentary, corporate and employee orders
+(Warehouse/Store)."""
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
@@ -12,7 +14,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from lib import auth, charts, colors, db, grid, queries, theme
+from lib import auth, charts, colors, db, filters, grid, queries, theme
 from lib import stock_flow as sf
 from lib import stock_planning as sp
 
@@ -21,8 +23,8 @@ st.set_page_config(page_title=auth.page_title("Stock Levels"), page_icon="📦",
 auth.require_login()
 
 st.title("📦 Stock Levels")
-st.caption("Live stock by location and product, and what the shops will need — straight from "
-           "Postgres. No date range: stock is the current state, sales are the last 90 days.")
+st.caption("Live stock by location and product, what the shops will need, and the warehouse's "
+           "events — straight from Postgres. Stock is the current state, sales are the last 90 days.")
 
 connected, detail = db.check_connection()
 if not connected:
@@ -603,8 +605,58 @@ def _min_max(base: pd.DataFrame, planned_sku: pd.DataFrame, targets: pd.DataFram
                    f"and a maximum of {rate * max_days:,.0f} on hand ({where.lower()}).")
 
 
-section = _section(["🏪 Shop Stocks", "🔮 Stock Prediction & Movement"], "stock_page_section")
-if section == "🏪 Shop Stocks":
-    render_shop_stock()
-else:
-    render_prediction()
+# ------------------------------------------------------- Warehouse/Store ---
+
+EVENT_TYPES = ["Transfer", "Shoot List", "Complimentary", "Corporate Order", "Employee Order"]
+EVENT_COLUMNS = ["Date", "Type", "Reference", "From", "To", "Detail", "Status", "Qty", "By"]
+_EVENT_DATE = {"Date": st.column_config.DatetimeColumn(format="ddd D MMM, HH:mm")}
+
+
+def render_warehouse() -> None:
+    """The main events in Odoo's Warehouse/Store app (queries.WAREHOUSE_EVENTS)."""
+    c1, _ = st.columns([1, 3])
+    with c1:
+        start, end = filters.date_range_control("warehouse", default="Last 7 Days")
+    df = db.run_query(queries.WAREHOUSE_EVENTS, {"start_date": start, "end_date": end})
+    waiting = df[df["Open"]]
+    period = df[df["Date"].dt.date.between(start, end)]
+    if df.empty:
+        st.info("No warehouse activity for this period, and nothing waiting.")
+        return
+
+    by_type = period.groupby("Type")["Qty"].agg(["size", "sum"]).reindex(EVENT_TYPES, fill_value=0)
+    _kpis([(t if t == "Complimentary" else f"{t}s", f"{by_type.loc[t, 'size']:,.0f}", f"{by_type.loc[t, 'sum']:,.0f} units")
+           for t in EVENT_TYPES])
+
+    st.subheader("Waiting on the store")
+    if waiting.empty:
+        st.success("Nothing is waiting.", icon="✅")
+    else:
+        st.caption("Submitted but not yet issued or delivered, and shoot lists with bags still out — "
+                   "whatever the period above.")
+        st.dataframe(waiting[[c for c in EVENT_COLUMNS if c not in ("From", "To")]],
+                     hide_index=True, width="stretch", column_config=_EVENT_DATE)
+
+    st.subheader(f"Events · {start:%d %b} to {end:%d %b %Y}")
+    transfers = period[period["Type"] == "Transfer"]
+    if not transfers.empty:
+        with st.container(border=True):
+            routes = (transfers.assign(Route=transfers["From"] + " → " + transfers["To"])
+                      .groupby("Route")["Qty"].sum().nlargest(15).sort_values())
+            fig = go.Figure()
+            fig.add_bar(y=routes.index, x=routes.values, orientation="h",
+                        marker=dict(color=theme.sequential_colors(len(routes)), cornerradius=4))
+            theme.apply_layout(fig, show_legend=False)
+            fig.update_layout(title="Units Transferred by Route", height=max(360, 28 * len(routes)))
+            theme.show(fig, width="stretch")
+
+    shown = st.pills("Show", EVENT_TYPES, selection_mode="multi", default=EVENT_TYPES,
+                     key="warehouse_types", label_visibility="collapsed")
+    with st.container(border=True):
+        st.caption("Click a column header's filter icon to search or narrow that column.")
+        grid.filterable_table(period.loc[period["Type"].isin(shown), EVENT_COLUMNS])
+
+
+SECTIONS = {"🏪 Shop Stocks": render_shop_stock, "🔮 Stock Prediction & Movement": render_prediction,
+            "🏬 Warehouse/Store": render_warehouse}
+SECTIONS[_section(list(SECTIONS), "stock_page_section")]()

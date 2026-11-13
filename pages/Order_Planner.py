@@ -160,6 +160,16 @@ if section == SECTIONS[0]:
         grid.filterable_table(by_shop, pinned_columns=("Shop",), height=520)
     _download(by_shop, f"dispatch_plan_{start:%Y_%m}.csv", "op_dl_shop")
 
+    st.subheader("By product, colour and location")
+    st.caption("The same plan one level down: each colour of each bag for each shop, and how many go on each "
+               "dispatch. Filter under Shop, Product or Colour.")
+    detail = (lines.loc[lines["Send"] > 0, ["Location", "Bag", "Colour", "Stock Counted In", "Send", *date_cols]]
+              .rename(columns={"Location": "Shop", "Bag": "Product", "Stock Counted In": "On Hand", "Send": "To Send"})
+              .sort_values(["Shop", "To Send"], ascending=[True, False]))
+    with st.container(border=True):
+        grid.filterable_table(detail, pinned_columns=("Shop", "Product", "Colour"), height=560)
+    _download(detail, f"dispatch_plan_by_colour_{start:%Y_%m}.csv", "op_dl_detail")
+
 # -------------------------------------------------------- Shop Orders ---
 elif section == SECTIONS[1]:
     f1, f2, f3 = st.columns([1, 1, 2])

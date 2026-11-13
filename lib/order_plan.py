@@ -20,7 +20,8 @@ The steps, in order:
    next one, so the units arrive through the month instead of all at once.
 6. Supply. Each bag's sends are met from the warehouse first, then from bags
    already cut; the rest is the production workplan, dated by the dispatch
-   that first needs it.
+   that first needs it. Website and KTDA take theirs from CBD/Stock; what
+   CBD/Stock cannot cover has to be restocked into it first.
 """
 from __future__ import annotations
 
@@ -33,6 +34,13 @@ from lib import stock_planning as sp
 
 BEST, STRONG, STEADY, SLOW, DORMANT = "Best mover", "Strong", "Steady", "Slow", "Dormant"
 SPLIT_TREND, SPLIT_TARGETS = "Sales trend", "Shop targets in Odoo"
+
+
+# Website and KTDA collect their stock from the CBD/Stock warehouse. CBD/Stock
+# (with what is on its way there) is also warehouse supply for every other shop.
+CBD_FED = ("Website", "Ktda")
+CBD_STOCK = ("Cbd", "Cbd Stocks")  # STOCK_POSITION's names for CBD/Stock and transit to it
+FROM_CBD, FROM_WAREHOUSE = "CBD/Stock", "Warehouse"
 
 
 def dispatch_dates(first: date, last: date, weekdays: set[int]) -> list[date]:
@@ -164,12 +172,25 @@ def build(base: pd.DataFrame, position: pd.DataFrame, demand: pd.DataFrame, *,
                   [["Bag", "SKU", "Send", "In Warehouse", "From Warehouse", "Already Cut", "To Make", "Needed By"]]
                   .sort_values(["Needed By", "To Make"], ascending=[True, False]).reset_index(drop=True))
 
-    # each line's share of what the warehouse can cover now
-    ratio = (sku["From Warehouse"] / sku["Send"]).set_axis(sku["Product ID"])
-    df["From Warehouse"] = np.floor(df["Send"] * df["Product ID"].map(ratio).fillna(0))
+    # Each line's share of what the warehouse can cover now. Website and KTDA
+    # draw on CBD/Stock first; the other shops on everything that leaves.
+    fed = df["Location"].isin(CBD_FED)
+    at_cbd = position[(position["Bucket"] == "Warehouse") & position["Location"].isin(CBD_STOCK)]
+    cbd = sku["Product ID"].map(at_cbd.groupby("Product ID")["Qty"].sum().clip(lower=0)).fillna(0)
+    send_fed = sku["Product ID"].map(df.loc[fed].groupby("Product ID")["Send"].sum()).fillna(0)
+    send_rest = sku["Send"] - send_fed
+    fed_from_cbd = np.minimum(send_fed, cbd)
+    rest_covered = np.minimum(send_rest, wh - fed_from_cbd)
+    fed_covered = fed_from_cbd + np.minimum(send_fed - fed_from_cbd, wh - fed_from_cbd - rest_covered)
+    share = lambda covered, sent: (covered / sent.where(sent > 0)).fillna(0).set_axis(sku["Product ID"])
+    ratio = np.where(fed, df["Product ID"].map(share(fed_covered, send_fed)),
+                     df["Product ID"].map(share(rest_covered, send_rest)))
+    df["Source"] = np.where(fed, FROM_CBD, FROM_WAREHOUSE)
+    df["From Warehouse"] = _round_to_total(df["Send"] * pd.Series(ratio, index=df.index).fillna(0),
+                                           df["Product ID"].astype(str) + df["Source"])
     df["Awaiting Production"] = df["Send"] - df["From Warehouse"]
 
-    lines = df[["Location", "Bag", "SKU", "Colour", "Standing", "Colour Share %", "Sold 90d", "Sold 30d",
+    lines = df[["Location", "Source", "Bag", "SKU", "Colour", "Standing", "Colour Share %", "Sold 90d", "Sold 30d",
                 "Trend %", "Stock Counted In", "Need", "Send", "From Warehouse", "Awaiting Production",
                 *cols, "Price", "Shop Target", "Sold MTD", "On Hand"]]
     summary = {
@@ -177,5 +198,6 @@ def build(base: pd.DataFrame, position: pd.DataFrame, demand: pd.DataFrame, *,
         "sold": 0 if future else df["Sold MTD"].sum(), "days": days, "future": future,
         "on_hand": opening.sum(), "send": send.sum(), "from_warehouse": sku["From Warehouse"].sum(),
         "already_cut": sku["Already Cut"].sum(), "to_make": sku["To Make"].sum(), "dates": cols,
+        "cbd_send": send_fed.sum(), "cbd_has": fed_from_cbd.sum(), "cbd_stock": at_cbd["Qty"].clip(lower=0).sum(),
     }
     return {"lines": lines, "production": production, "by_date": pd.DataFrame(by_date), "summary": summary}

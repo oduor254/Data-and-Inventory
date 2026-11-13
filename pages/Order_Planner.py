@@ -23,7 +23,8 @@ auth.require_login()
 
 st.title("🎯 Order Planner")
 st.caption("Set the month's target and the planner suggests what to send each shop, colour by colour, "
-           "on each dispatch, and what production must make. Bags only; sales are the last 90 days.")
+           "on each dispatch, and what production must make. Bags only; sales are the last 90 days. "
+           "Website and KTDA take their stock from the CBD/Stock warehouse; every other shop is sent from the warehouse.")
 
 connected, detail = db.check_connection()
 if not connected:
@@ -148,9 +149,14 @@ if section == SECTIONS[0]:
     st.caption("Each dispatch carries what a shop needs to last until the next one, so the first is the "
                "largest: it also fills what the shops are short of today.")
 
+    short = s["cbd_send"] - s["cbd_has"]
+    st.info(f"**CBD/Stock** holds {s['cbd_stock']:,.0f} bags. Website and KTDA need **{s['cbd_send']:,.0f}** from it "
+            f"this period; it already has {s['cbd_has']:,.0f} of those in the right bags and colours"
+            + (f", so **{short:,.0f} must be restocked into CBD/Stock** first." if short > 0 else "."), icon="🏬")
+
     st.subheader("By shop")
     by_shop = lines.groupby("Location").agg(
-        **{"Month Target": ("Shop Target", "first"), "Sold So Far": ("Sold MTD", "sum"),
+        **{"Takes Stock From": ("Source", "first"), "Month Target": ("Shop Target", "first"), "Sold So Far": ("Sold MTD", "sum"),
            "On Hand": ("Stock Counted In", "sum"), "To Send": ("Send", "sum"),
            **{c: (c, "sum") for c in date_cols}}).reset_index().rename(columns={"Location": "Shop"})
     by_shop["Month Target"] = by_shop["Month Target"].round(0)
@@ -163,8 +169,9 @@ if section == SECTIONS[0]:
     st.subheader("By product, colour and location")
     st.caption("The same plan one level down: each colour of each bag for each shop, and how many go on each "
                "dispatch. Filter under Shop, Product or Colour.")
-    detail = (lines.loc[lines["Send"] > 0, ["Location", "Bag", "Colour", "Stock Counted In", "Send", *date_cols]]
-              .rename(columns={"Location": "Shop", "Bag": "Product", "Stock Counted In": "On Hand", "Send": "To Send"})
+    detail = (lines.loc[lines["Send"] > 0, ["Location", "Source", "Bag", "Colour", "Stock Counted In", "Send", *date_cols]]
+              .rename(columns={"Location": "Shop", "Source": "Takes Stock From", "Bag": "Product",
+                               "Stock Counted In": "On Hand", "Send": "To Send"})
               .sort_values(["Shop", "To Send"], ascending=[True, False]))
     with st.container(border=True):
         grid.filterable_table(detail, pinned_columns=("Shop", "Product", "Colour"), height=560)
@@ -180,10 +187,11 @@ elif section == SECTIONS[1]:
     view = view[view[qty] > 0].sort_values(["Location", qty], ascending=[True, False])
     f3.metric(f"Bags to send · {shop} · {when}", f"{view[qty].sum():,.0f}",
               f"{len(view):,} bag colours", delta_color="off")
-    cols = ["Location", "Bag", "Colour", "Standing", "Colour Share %", "Sold 30d", "Trend %",
+    cols = ["Location", "Source", "Bag", "Colour", "Standing", "Colour Share %", "Sold 30d", "Trend %",
             "Stock Counted In", "Need", "Send", "From Warehouse", "Awaiting Production"]
     order = view[cols + ([when] if when != "Whole month" else date_cols)].rename(
-        columns={"Location": "Shop", "Stock Counted In": "On Hand", "Send": "Send (Month)"})
+        columns={"Location": "Shop", "Source": "Takes Stock From", "Stock Counted In": "On Hand",
+                 "Send": "Send (Month)"})
     with st.container(border=True):
         st.caption("Standing is the colour's place among that bag's colours at the shop. Colour Share is its "
                    "part of the bag's sales there. Need is the bags expected to sell in the rest of the month.")

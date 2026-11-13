@@ -4689,6 +4689,7 @@ placed AS (
         END AS bucket,
         CASE
             WHEN s.code IS NOT NULL THEN s.shop
+            WHEN sl.complete_name ILIKE 'CBD/Stock%' THEN 'Cbd'   -- told apart from VLD for the order planner
             WHEN sl.complete_name ILIKE 'FINWH/Goods in Transit/%' THEN
                 CASE UPPER(split_part(sl.complete_name, '/', 3))
                     WHEN 'DAR-ES-ALAM'   THEN 'Sinza'

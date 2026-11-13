@@ -38,4 +38,18 @@ assert black["To Make"] == black["Send"] - 16 and black["Needed By"] in dates
 big = op.build(base, position, demand, units_target=100, revenue_target=600000, today=today, start=start, end=end,
                dispatches=dates)["summary"]
 assert round(big["avg_price"]) == 3000 and round(big["required"]) == 200
+
+# KTDA takes its stock from CBD/Stock; CBD/Stock is still warehouse supply for the other shop
+both = pd.concat([demand, demand.assign(Location="Ktda")])
+pos2 = pd.DataFrame({"Bucket": ["Shop", "Shop", "Warehouse", "Warehouse"], "Location": ["Shop", "Ktda", "Cbd", ""],
+                     "Product ID": [1] * 4, "SKU": ["Code 3 Black"] * 4, "Category": ["Backpacks"] * 4,
+                     "Qty": [0, 0, 30, 20]})
+two = op.build(sp.shop_sku(pos2, both, ["Ktda", "Shop"]), pos2, both, units_target=200, revenue_target=0,
+               today=today, start=start, end=end, dispatches=dates, cover_days=0)
+t, ts = two["lines"][two["lines"]["SKU"] == "Code 3 Black"].set_index("Location"), two["summary"]
+assert t.loc["Ktda", "Source"] == op.FROM_CBD and t.loc["Shop", "Source"] == op.FROM_WAREHOUSE
+ktda = two["lines"][two["lines"]["Location"] == "Ktda"]
+assert ts["cbd_stock"] == 30 and ts["cbd_has"] == 30 and ts["cbd_send"] == ktda["Send"].sum() > 30
+assert t.loc["Ktda", "From Warehouse"] == 30 and t.loc["Shop", "From Warehouse"] == 20   # CBD first, the rest to the shop
+assert ts["from_warehouse"] == 50
 print("ok order_plan")

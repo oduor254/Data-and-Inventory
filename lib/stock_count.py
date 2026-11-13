@@ -134,7 +134,16 @@ def load() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                 pool.submit(db.run_query, queries.STOCK_FLOW_NOW),
                 pool.submit(voids)]
         closed, fresh, now, v = [j.result() for j in jobs]
-    return s, counts(s, pd.concat([closed, fresh], ignore_index=True), now), v
+    moves = pd.concat([closed, fresh], ignore_index=True)
+    done = counts(s, moves, now)  # also gives moves its Date and Net columns
+    # Counts in progress: the books now, and what they were at the first scan.
+    current = now[now["Kind"] == "Current Stock"].groupby("Code")["Qty"].sum()
+    s["Stock Now"] = s["Code"].map(current)
+    s["Stock At Start"] = [
+        current[c] - moves.loc[(moves["Code"] == c) & (moves["Date"] > t), "Net"].sum()
+        if c in current.index and pd.notna(t) else float("nan")
+        for c, t in zip(s["Code"], s["First Scan"].where(s["State"] == "open"))]
+    return s, done, v
 
 
 def counts(s: pd.DataFrame, moves: pd.DataFrame, now: pd.DataFrame) -> pd.DataFrame:

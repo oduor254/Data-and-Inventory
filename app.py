@@ -21,6 +21,7 @@ nav = st.navigation([
     st.Page("pages/Workplan.py", title="Workplan", icon="🗓️"),
     st.Page("pages/Dispatch.py", title="Dispatch", icon="🚛"),
     st.Page("pages/Stock_Levels.py", title="Stock Levels", icon="📦"),
+    st.Page("pages/Order_Planner.py", title="Order Planner", icon="🎯"),
     st.Page("pages/Stock_Count.py", title="Stock Count", icon="🧮"),
 ])
 

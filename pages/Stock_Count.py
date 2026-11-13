@@ -35,13 +35,17 @@ balance = sc.balance(all_counts)
 now = pd.Timestamp.now(tz="Africa/Nairobi").tz_localize(None)
 
 
-def _ago(t: pd.Timestamp) -> str:
-    mins = int((now - t).total_seconds() // 60)
+def _span(delta: pd.Timedelta) -> str:
+    mins = int(delta.total_seconds() // 60)
     if mins < 60:
-        return f"{mins} min ago"
+        return f"{mins} min"
     if mins < 48 * 60:
-        return f"{mins // 60} h ago"
-    return f"{mins // 1440} days ago"
+        return f"{mins // 60} h {mins % 60} min"
+    return f"{mins // 1440} days"
+
+
+def _ago(t: pd.Timestamp) -> str:
+    return f"{_span(now - t)} ago"
 
 
 # -------------------------------------------------------- Counting now ---
@@ -50,6 +54,7 @@ started = sc.counting_now(sessions)
 recent = started["Last Scan"] > now - pd.Timedelta(hours=12)
 live, stalled = started[recent], started[~recent]
 names = dict(zip(balance["Code"], balance["Location"]))
+last_count = dict(zip(balance["Code"], balance["Last Count"]))
 if live.empty:
     st.success("No location is counting right now.", icon="✅")
 else:
@@ -57,12 +62,23 @@ else:
         with col.container(border=True):
             st.metric(names.get(r["Code"], r["Code"]), f"{r['Scans']:,} bags scanned",
                       f"last scan {_ago(r['Last Scan'])}", delta_color="off")
-            st.caption(f"{r['Count']} · started {r['First Scan']:%a %d %b %H:%M}")
+            if pd.notna(r["Stock Now"]):
+                left = r["Stock Now"] - r["Scans"]
+                st.caption(f"Stock at start **{r['Stock At Start']:,.0f}** · now {r['Stock Now']:,.0f} · "
+                           + (f"**{left:,.0f} to scan**" if left > 0 else
+                              "**all scanned**" if left == 0 else f"**{-left:,.0f} over**"))
+            st.caption(f"{r['Count']} · started {r['First Scan']:%a %d %b %H:%M} · "
+                       f"counting for {_span(r['Last Scan'] - r['First Scan'])}")
+            prev = last_count.get(r["Code"])
+            st.caption(f"Previous count {prev:%a %d %b} · {_span(r['First Scan'] - prev)} between counts"
+                       if prev is not None else "First count at this location")
 if not stalled.empty:
     st.warning("Started but not submitted: " + "; ".join(
         f"**{names.get(r['Code'], r['Code'])}** ({r['Count']}, {r['Scans']:,} bags, "
         f"last scan {_ago(r['Last Scan'])})" for _, r in stalled.iterrows()), icon="⏸️")
-st.caption("A location is counting when its open count session has a scan in the last 12 hours. "
+st.caption("To scan is the stock on the books now less the bags scanned so far; stock at start is what "
+           "the books held at the first scan. "
+           "A location is counting when its open count session has a scan in the last 12 hours. "
            "Sessions with no scans are just the next count waiting to start.")
 
 # ------------------------------------------------- Last count per shop ---

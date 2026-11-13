@@ -74,13 +74,22 @@ open_queue = queue[queue["Status"] != "Done"]
 
 demand, to_draw, drawn = plans["Demand"].sum(), plans["To Draw"].sum(), plans["Drawn"].sum()
 covered = plans["Covered by Cut Store"].sum() + plans["Covered by WIP"].sum()
+finished = plans["Finished"].sum()
+# Completion: bags finished out of the bags the plan sent to be drawn.
+plans["Completion %"] = (plans["Finished"] / plans["To Draw"].where(plans["To Draw"] > 0) * 100).round(0)
 _kpis([
     ("Bags Demanded", f"{demand:,.0f}", f"{len(plans):,} plan{'s' if len(plans) != 1 else ''}"),
     ("Already Covered", f"{covered:,.0f}", "by the cut-bag store and WIP"),
     ("To Draw", f"{to_draw:,.0f}", f"{len(queue):,} draw requests"),
+    ("Completion Rate", f"{finished / to_draw:.0%}" if to_draw else "—", "finished out of to draw"),
+])
+_kpis([
     ("Drawn", f"{drawn:,.0f}", f"{drawn / to_draw:.0%} of what was asked" if to_draw else None),
-    ("Still to Draw", f"{open_queue['Remaining'].sum():,.0f}", f"{len(open_queue):,} requests open"),
-    ("Oldest Open Request", f"{open_queue['Days Waiting'].max():,.0f} days" if len(open_queue) else "None", None),
+    ("Still to Draw", f"{open_queue['Remaining'].sum():,.0f}",
+     f"{len(open_queue):,} requests open" + (f", oldest {open_queue['Days Waiting'].max():,.0f} days"
+                                               if len(open_queue) else "")),
+    ("Issued to Tailors", f"{plans['Issued to Tailors'].sum():,.0f}", "bags being stitched or done"),
+    ("Finished", f"{finished:,.0f}", "passed quality check"),
 ])
 
 SECTIONS = ["📋 Plans", "✂️ Draw Queue", "🧵 Tailors & Issue"]
@@ -89,10 +98,22 @@ section = st.segmented_control("Section", SECTIONS, default=SECTIONS[0], key="wp
 
 # ------------------------------------------------------------ Plans ---
 if section == SECTIONS[0]:
-    st.subheader("Draw progress by plan")
-    st.caption("Each plan's draw requests: how many bags have been drawn and how many are still open.")
-    with st.container(border=True):
-        recent = plans.head(15).iloc[::-1].rename(columns={"Still to Draw": "Remaining"})
+    st.subheader("Progress by plan")
+    st.caption("Completion is the bags finished (passed quality check) out of the bags the plan sent to be "
+               "drawn. Draw progress is the first step: how many have been drawn and how many are still open.")
+    recent = plans.head(15).iloc[::-1].rename(columns={"Still to Draw": "Remaining"})
+    a, b = st.columns(2)
+    with a.container(border=True):
+        fig = go.Figure()
+        fig.add_bar(y=recent["Plan"], x=recent["Completion %"].fillna(0), orientation="h",
+                    marker=dict(color=DONE, cornerradius=4),
+                    text=recent["Completion %"].map(lambda v: "" if pd.isna(v) else f"{v:.0f}%"),
+                    textposition="outside")
+        theme.apply_layout(fig, show_legend=False)
+        fig.update_layout(title="Completion Rate — latest plans", height=max(320, 30 * len(recent) + 120),
+                          xaxis=dict(ticksuffix="%"))
+        theme.show(fig, width="stretch")
+    with b.container(border=True):
         _progress_bars(recent, "Plan", "Drawn against Still to Draw — latest plans")
 
     st.subheader("All plans")

@@ -4738,7 +4738,9 @@ lines AS (
         END AS location,
         pol.product_id, pt.name AS sku, pc.name AS category,
         po.date_order::DATE AS sold_on,
-        pol.qty + COALESCE(ref.qty, 0) AS qty
+        pol.qty + COALESCE(ref.qty, 0) AS qty,
+        -- what the kept bags brought in: the line's value less the refunded share
+        pol.price_subtotal_incl * (pol.qty + COALESCE(ref.qty, 0)) / pol.qty AS revenue
     FROM pos_order po
     JOIN pos_order_line            pol   ON pol.order_id = po.id
     LEFT JOIN refunded             ref   ON ref.line_id = pol.id
@@ -4762,6 +4764,7 @@ lines AS (
 SELECT location AS "Location", product_id AS "Product ID", sku AS "SKU",
        category AS "Category",
        SUM(qty)                                                             AS "Sold 90d",
+       SUM(revenue)                                                         AS "Revenue 90d",
        COALESCE(SUM(qty) FILTER (WHERE sold_on >= CURRENT_DATE - 30), 0)    AS "Sold 30d",
        COALESCE(SUM(qty) FILTER (
            WHERE sold_on >= DATE_TRUNC('month', CURRENT_DATE)), 0)          AS "Sold MTD",
@@ -4783,7 +4786,7 @@ WITH mapping(location, target_branch) AS (
            ('Kakamega', 'KAKAMEGA'), ('Kitengela', 'KITENGELA'), ('Meru', 'MERU')
 )
 SELECT m.location AS "Location", DATE_TRUNC('month', t.start_date)::DATE AS "Month",
-       SUM(t.target_qty) AS "Target Bags"
+       SUM(t.target_qty) AS "Target Bags", SUM(t.target_amount) AS "Target Revenue"
 FROM sales_pos_target t
 JOIN mapping m ON t.name ILIKE m.target_branch || '%'
 WHERE t.period = 'month'
@@ -5860,8 +5863,17 @@ SELECT p.id AS "Plan Id", p.name AS "Plan", p.plan_date AS "Plan Date",
        COALESCE(l.store, 0) AS "Covered by Cut Store", COALESCE(l.wip, 0) AS "Covered by WIP",
        COALESCE(d.requested, 0) AS "To Draw", COALESCE(d.drawn, 0) AS "Drawn",
        COALESCE(d.remaining, 0) AS "Still to Draw", COALESCE(d.open_requests, 0) AS "Open Requests",
+       COALESCE(f.issued, 0) AS "Issued to Tailors", COALESCE(f.finished, 0) AS "Finished",
        COALESCE(p.buy_count, 0) AS "Materials to Buy"
 FROM denri_production_plan p
+-- Bags traced back to the plan (bag -> drawing -> draw request -> plan). A bag
+-- is finished once it is validated: in the store, dispatched, in a shop or sold.
+LEFT JOIN (SELECT r.plan_id, COUNT(*) AS issued,
+                  COUNT(*) FILTER (WHERE u.state NOT IN ('issued', 'collected', 'qc_pass', 'qc_fail')) AS finished
+           FROM denri_bag_unit u
+           JOIN denri_drawing_order dw ON dw.id = u.drawing_order_id
+           JOIN denri_draw_request r ON r.id = dw.draw_request_id
+           WHERE u.active GROUP BY 1) f ON f.plan_id = p.id
 LEFT JOIN res_users u ON u.id = p.planned_by_id
 LEFT JOIN res_partner rp ON rp.id = u.partner_id
 LEFT JOIN (SELECT plan_id, COUNT(*) AS bags, SUM(qty_demand) AS demand,

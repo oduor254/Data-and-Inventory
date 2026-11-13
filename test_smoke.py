@@ -16,7 +16,7 @@ def check(at, name):
     print("ok", name.encode("ascii", "ignore").decode())  # Windows consoles choke on emoji
 
 
-for page in sorted(Path("pages").glob("*.py")):
+for page in sorted(Path("pages").glob(sys.argv[1] if len(sys.argv) > 1 else "*.py")):
     at = AppTest.from_file(str(page), default_timeout=300)
     at.session_state["authenticated"] = True
     at.run()

@@ -5841,3 +5841,94 @@ LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id
 WHERE u.active AND u.state IN ('collected', 'qc_pass', 'validated')
 GROUP BY 1, 2 ORDER BY 1, 3 DESC
 """
+
+
+# ------------------------------------------------------------- Workplan ---
+# Odoo's Workplan app (denri_workplan): a production plan lists the bags to
+# make; on approval each bag not covered by the cut-bag store or WIP becomes a
+# draw request, then tailors are allocated and cut bags are issued to them.
+
+# One row per plan: its demand, what stock already covered, and how far the
+# draw requests it raised have got.
+WORKPLAN_PLANS = """
+SELECT p.id AS "Plan Id", p.name AS "Plan", p.plan_date AS "Plan Date",
+       CASE p.country WHEN 'tz' THEN 'Tanzania' WHEN 'ug' THEN 'Uganda' ELSE 'Kenya' END AS "Country",
+       CASE WHEN p.plan_type = 'newshop' THEN 'New shop' WHEN p.is_corporate OR p.plan_type = 'corporate' THEN 'Corporate'
+            ELSE 'Normal' END AS "Type",
+       INITCAP(p.state) AS "Status", rp.name AS "Planned By",
+       COALESCE(l.bags, 0) AS "Bag Types", COALESCE(l.demand, 0) AS "Demand",
+       COALESCE(l.store, 0) AS "Covered by Cut Store", COALESCE(l.wip, 0) AS "Covered by WIP",
+       COALESCE(d.requested, 0) AS "To Draw", COALESCE(d.drawn, 0) AS "Drawn",
+       COALESCE(d.remaining, 0) AS "Still to Draw", COALESCE(d.open_requests, 0) AS "Open Requests",
+       COALESCE(p.buy_count, 0) AS "Materials to Buy"
+FROM denri_production_plan p
+LEFT JOIN res_users u ON u.id = p.planned_by_id
+LEFT JOIN res_partner rp ON rp.id = u.partner_id
+LEFT JOIN (SELECT plan_id, COUNT(*) AS bags, SUM(qty_demand) AS demand,
+                  SUM(qty_covered_store) AS store, SUM(qty_covered_wip) AS wip
+           FROM denri_production_plan_line GROUP BY 1) l ON l.plan_id = p.id
+LEFT JOIN (SELECT plan_id, SUM(qty_requested) AS requested, SUM(qty_drawn) AS drawn,
+                  SUM(qty_remaining) FILTER (WHERE state IN ('pending', 'in_progress')) AS remaining,
+                  COUNT(*) FILTER (WHERE state IN ('pending', 'in_progress')) AS open_requests
+           FROM denri_draw_request WHERE state <> 'cancelled' GROUP BY 1) d ON d.plan_id = p.id
+WHERE p.state <> 'cancelled'
+ORDER BY p.plan_date DESC, p.id DESC
+"""
+
+# Every draw request a plan raised (the queue the drawing floor works from).
+WORKPLAN_DRAW_QUEUE = """
+SELECT r.plan_id AS "Plan Id", p.name AS "Plan", pt.name AS "Bag",
+       CASE r.priority WHEN '3' THEN 'Very high' WHEN '2' THEN 'High' WHEN '1' THEN 'Normal' ELSE 'Low' END AS "Priority",
+       CASE r.state WHEN 'pending' THEN 'Pending' WHEN 'in_progress' THEN 'In progress' ELSE 'Done' END AS "Status",
+       r.qty_requested AS "Requested", r.qty_drawn AS "Drawn",
+       CASE WHEN r.state = 'done' THEN 0 ELSE r.qty_remaining END AS "Remaining",
+       r.request_date AS "Requested On",
+       CASE WHEN r.state = 'done' THEN NULL ELSE CURRENT_DATE - r.request_date END AS "Days Waiting"
+FROM denri_draw_request r
+JOIN denri_production_plan p ON p.id = r.plan_id
+JOIN product_product pp ON pp.id = r.bag_product_id
+LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id
+WHERE r.state <> 'cancelled'
+ORDER BY r.priority DESC, r.request_date
+"""
+
+# Tailor plan: which tailor stitches which bag, how many, starting when.
+WORKPLAN_ALLOCATIONS = """
+SELECT tp.plan_id AS "Plan Id", p.name AS "Plan", e.name AS "Tailor", COALESCE(tl.name, 'Not assessed') AS "Tailor Level",
+       pt.name AS "Bag", COALESCE(bc.name, 'Not set') AS "Bag Complexity",
+       l.qty AS "Bags", l.start_date AS "Start Stitching"
+FROM denri_tailor_plan_line l
+JOIN denri_tailor_plan tp ON tp.id = l.tailor_plan_id
+JOIN denri_production_plan p ON p.id = tp.plan_id
+LEFT JOIN hr_employee e ON e.id = l.tailor_id
+LEFT JOIN denri_bag_complexity tl ON tl.id = e.denri_max_complexity_id
+JOIN product_product pp ON pp.id = l.bag_product_id
+LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id
+LEFT JOIN denri_bag_complexity bc ON bc.id = pt.denri_complexity_id
+ORDER BY l.start_date, e.name
+"""
+
+# Requests to issue cut bags to a tailor: everything still pending, plus what
+# was issued in the period.
+WORKPLAN_ISSUE_REQUESTS = """
+SELECT i.name AS "Reference", i.request_date AS "Requested On", e.name AS "Tailor", pt.name AS "Bag",
+       i.qty_requested AS "Bags", CASE i.state WHEN 'pending' THEN 'Pending' ELSE 'Issued' END AS "Status",
+       CASE WHEN i.state = 'pending' THEN CURRENT_DATE - i.request_date END AS "Days Waiting"
+FROM denri_workplan_issue_request i
+LEFT JOIN hr_employee e ON e.id = i.tailor_employee_id
+JOIN product_product pp ON pp.id = i.bag_product_id
+LEFT JOIN product_template pt ON pt.id = pp.product_tmpl_id
+WHERE i.state = 'pending'
+   OR (i.state = 'done' AND i.request_date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE))
+ORDER BY i.request_date DESC, e.name
+"""
+
+# How many bags a tailor of each level gets through in a day, by bag difficulty.
+WORKPLAN_CAPACITY = """
+SELECT tl.name AS "Tailor Level", bc.name AS "Bag Complexity",
+       r.bags_per_day_min AS "Min Bags per Day", r.bags_per_day_max AS "Max Bags per Day"
+FROM denri_tailor_capacity_rule r
+JOIN denri_bag_complexity tl ON tl.id = r.tailor_level_id
+JOIN denri_bag_complexity bc ON bc.id = r.complexity_id
+WHERE r.active ORDER BY tl.sequence, bc.sequence
+"""

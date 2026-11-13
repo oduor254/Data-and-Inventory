@@ -18,6 +18,7 @@ from lib import auth
 
 nav = st.navigation([
     st.Page("pages/Production.py", title="Production", icon="🏭", default=True),
+    st.Page("pages/Workplan.py", title="Workplan", icon="🗓️"),
     st.Page("pages/Dispatch.py", title="Dispatch", icon="🚛"),
     st.Page("pages/Stock_Levels.py", title="Stock Levels", icon="📦"),
     st.Page("pages/Stock_Count.py", title="Stock Count", icon="🧮"),
